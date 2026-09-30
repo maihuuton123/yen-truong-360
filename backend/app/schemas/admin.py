@@ -25,6 +25,29 @@ class AdminDashboardOut(BaseModel):
     work: AdminWorkSummaryOut
 
 
+class AdminStatisticBucketOut(BaseModel):
+    key: str
+    label: str
+    value: int
+
+
+class AdminStatisticsOut(BaseModel):
+    total_reports: int
+    new_reports: int
+    received_reports: int
+    coordinating_reports: int
+    resolved_reports: int
+    out_of_scope_reports: int
+    by_category: list[AdminStatisticBucketOut]
+    by_area: list[AdminStatisticBucketOut]
+    by_date: list[AdminStatisticBucketOut]
+
+
+class AdminQrOut(BaseModel):
+    target_url: str
+    svg: str
+
+
 class AdminReportListItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

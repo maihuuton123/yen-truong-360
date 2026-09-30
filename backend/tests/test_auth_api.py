@@ -1,7 +1,10 @@
 import tempfile
 import unittest
+from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -28,9 +31,11 @@ class AuthApiTests(unittest.TestCase):
         self.previous_secret = settings.auth_secret_key
         self.previous_expiration = settings.auth_token_expire_seconds
         self.previous_upload_dir = settings.upload_dir
+        self.previous_public_site_url = settings.public_site_url
         settings.auth_secret_key = "unit-test-secret-key-change-me"
         settings.auth_token_expire_seconds = 900
         settings.upload_dir = str(Path(self.temp_dir.name) / "uploads")
+        settings.public_site_url = "https://thefour.top"
         security.reset_revoked_tokens()
 
         app = create_app()
@@ -43,6 +48,7 @@ class AuthApiTests(unittest.TestCase):
         settings.auth_secret_key = self.previous_secret
         settings.auth_token_expire_seconds = self.previous_expiration
         settings.upload_dir = self.previous_upload_dir
+        settings.public_site_url = self.previous_public_site_url
         security.reset_revoked_tokens()
         self.temp_dir.cleanup()
 
@@ -214,6 +220,36 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(body["work"]["new_reports"], 1)
         self.assertEqual(body["work"]["coordinating_reports"], 1)
         self.assertEqual(body["work"]["needs_update"], 2)
+
+    def test_admin_qr_uses_public_site_url_and_can_download_svg(self):
+        headers = self.auth_headers("admin", "admin-password")
+
+        response = self.client.get("/api/admin/qr", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["target_url"], "https://thefour.top")
+        self.assertIn("<svg", body["svg"])
+        self.assertIn("https://thefour.top", body["svg"])
+        self.assertNotIn("localhost", body["svg"])
+
+        download = self.client.get("/api/admin/qr/download", headers=headers)
+        self.assertEqual(download.status_code, 200)
+        self.assertIn("image/svg+xml", download.headers["content-type"])
+        self.assertEqual(download.headers["cache-control"], "no-store")
+        self.assertIn("YenTruong360_QR.svg", download.headers["content-disposition"])
+        self.assertIn("https://thefour.top", download.text)
+
+    def test_admin_qr_requires_admin_role(self):
+        self.assertEqual(self.client.get("/api/admin/qr").status_code, 401)
+        self.assertEqual(
+            self.client.get("/api/admin/qr", headers=self.auth_headers("receiver", "receiver-password")).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.get("/api/admin/qr/download", headers=self.auth_headers("handler", "handler-password")).status_code,
+            403,
+        )
 
     def test_admin_can_create_update_disable_category_with_audit_log(self):
         headers = self.auth_headers("admin", "admin-password")
@@ -934,6 +970,250 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(after_cards["coordinating"], before_cards["coordinating"] - 1)
         self.assertEqual(after_cards["resolved"], before_cards["resolved"] + 1)
+
+    def test_admin_statistics_counts_groups_filters_and_empty_state(self):
+        headers = self.auth_headers()
+        with self.SessionTesting() as db:
+            inactive_category = Category(
+                name="=TEST Category",
+                icon="formula",
+                is_active=False,
+                display_order=99,
+            )
+            inactive_area = Area(name="+TEST Area", is_active=False, display_order=99)
+            db.add_all([inactive_category, inactive_area])
+            db.flush()
+            report = Report(
+                tracking_code="YT360-EEE111",
+                category_id=inactive_category.id,
+                area_id=inactive_area.id,
+                description="Formula safety source.",
+                status=ReportStatus.OUT_OF_SCOPE,
+                internal_note="INTERNAL NOTE MUST NOT EXPORT",
+                public_response="Public only.",
+            )
+            db.add(report)
+            db.flush()
+            report.created_at = datetime(2026, 9, 30, 16, 59, 59)
+            report.updated_at = datetime(2026, 9, 30, 17, 5, 0)
+            db.commit()
+
+        response = self.client.get("/api/admin/statistics", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["total_reports"], 5)
+        self.assertEqual(body["new_reports"], 1)
+        self.assertEqual(body["received_reports"], 1)
+        self.assertEqual(body["coordinating_reports"], 1)
+        self.assertEqual(body["resolved_reports"], 1)
+        self.assertEqual(body["out_of_scope_reports"], 1)
+        with self.SessionTesting() as db:
+            category_1_name = db.get(Category, self.category_id).name
+            category_2_name = db.get(Category, self.category_2_id).name
+            area_1_name = db.get(Area, self.area_id).name
+            area_2_name = db.get(Area, self.area_2_id).name
+        category_counts = {item["label"]: item["value"] for item in body["by_category"]}
+        area_counts = {item["label"]: item["value"] for item in body["by_area"]}
+        self.assertEqual(category_counts[category_1_name], 3)
+        self.assertEqual(category_counts[category_2_name], 1)
+        self.assertEqual(category_counts["=TEST Category"], 1)
+        self.assertEqual(area_counts[area_1_name], 3)
+        self.assertEqual(area_counts[area_2_name], 1)
+        self.assertEqual(area_counts["+TEST Area"], 1)
+
+        filtered = self.client.get(
+            "/api/admin/statistics",
+            params={
+                "status": "OUT_OF_SCOPE",
+                "from_date": "2026-09-30",
+                "to_date": "2026-09-30",
+            },
+            headers=headers,
+        )
+        self.assertEqual(filtered.status_code, 200)
+        self.assertEqual(filtered.json()["total_reports"], 1)
+        self.assertEqual(filtered.json()["out_of_scope_reports"], 1)
+
+        empty = self.client.get(
+            "/api/admin/statistics",
+            params={"from_date": "1999-01-01", "to_date": "1999-01-02"},
+            headers=headers,
+        )
+        self.assertEqual(empty.status_code, 200)
+        self.assertEqual(empty.json()["total_reports"], 0)
+        self.assertEqual(empty.json()["by_category"], [])
+        self.assertEqual(empty.json()["by_area"], [])
+        self.assertEqual(empty.json()["by_date"], [])
+
+    def test_admin_statistics_and_export_require_valid_auth_for_all_roles(self):
+        for path in ["/api/admin/statistics", "/api/admin/statistics/export"]:
+            self.assertEqual(self.client.get(path).status_code, 401)
+            self.assertEqual(self.client.get(path, headers={"Authorization": "Bearer bad-token"}).status_code, 401)
+            self.assertEqual(self.client.get(path, headers=self.auth_headers("admin", "admin-password")).status_code, 200)
+            self.assertEqual(
+                self.client.get(path, headers=self.auth_headers("receiver", "receiver-password")).status_code,
+                200,
+            )
+            self.assertEqual(
+                self.client.get(path, headers=self.auth_headers("handler", "handler-password")).status_code,
+                200,
+            )
+
+    def test_excel_export_is_valid_filtered_and_does_not_leak_sensitive_fields(self):
+        headers = self.auth_headers()
+        with self.SessionTesting() as db:
+            category = db.get(Category, self.category_id)
+            area = db.get(Area, self.area_id)
+            report = db.query(Report).filter(Report.tracking_code == "YT360-AAAAAA").one()
+            report.created_at = datetime(2026, 9, 30, 16, 59, 59)
+            report.updated_at = datetime(2026, 9, 30, 16, 59, 59)
+            report.internal_note = "SECRET INTERNAL NOTE MUST NOT EXPORT"
+            category.name = "@TEST Category"
+            area.name = "-TEST Area"
+            db.commit()
+
+        response = self.client.get(
+            "/api/admin/statistics/export",
+            params={
+                "status": "NEW",
+                "category_id": self.category_id,
+                "area_id": self.area_id,
+                "from_date": "2026-09-30",
+                "to_date": "2026-09-30",
+            },
+            headers=headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.headers["content-type"],
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        self.assertIn("YenTruong360_ThongKe_", response.headers["content-disposition"])
+        self.assertIn(".xlsx", response.headers["content-disposition"])
+        sheet_xml = self.read_xlsx_sheet_xml(response.content)
+        self.assertIn("Mã phản ánh", sheet_xml)
+        self.assertIn("Ngày tiếp nhận", sheet_xml)
+        self.assertIn("YT360-AAAAAA", sheet_xml)
+        self.assertIn("@TEST Category", sheet_xml)
+        self.assertIn("-TEST Area", sheet_xml)
+        self.assertIn("Mới", sheet_xml)
+        self.assertEqual(sheet_xml.count("<row "), 2)
+        self.assertNotIn("password", sheet_xml.lower())
+        self.assertNotIn("password_hash", sheet_xml.lower())
+        self.assertNotIn("token", sheet_xml.lower())
+        self.assertNotIn("audit", sheet_xml.lower())
+        self.assertNotIn("SECRET INTERNAL NOTE", sheet_xml)
+        self.assertNotIn("<f>", sheet_xml)
+        self.assertIn('t="inlineStr"', sheet_xml)
+
+    def test_step10_controlled_12_report_dataset_matches_db_api_and_excel(self):
+        headers = self.auth_headers()
+        statuses = [
+            ReportStatus.NEW,
+            ReportStatus.NEW,
+            ReportStatus.NEW,
+            ReportStatus.RECEIVED,
+            ReportStatus.RECEIVED,
+            ReportStatus.COORDINATING,
+            ReportStatus.COORDINATING,
+            ReportStatus.COORDINATING,
+            ReportStatus.COORDINATING,
+            ReportStatus.RESOLVED,
+            ReportStatus.RESOLVED,
+            ReportStatus.RESOLVED,
+        ]
+        dates = [
+            datetime(2026, 9, 1, 0, 0, 0),
+            datetime(2026, 9, 1, 12, 0, 0),
+            datetime(2026, 9, 5, 9, 15, 0),
+            datetime(2026, 9, 10, 11, 30, 0),
+            datetime(2026, 9, 15, 8, 0, 0),
+            datetime(2026, 9, 20, 13, 45, 0),
+            datetime(2026, 9, 25, 16, 0, 0),
+            datetime(2026, 9, 30, 0, 0, 0),
+            datetime(2026, 9, 30, 16, 59, 59),
+            datetime(2026, 9, 12, 10, 10, 0),
+            datetime(2026, 9, 18, 10, 10, 0),
+            datetime(2026, 9, 28, 10, 10, 0),
+        ]
+        with self.SessionTesting() as db:
+            for existing_report in db.query(Report).all():
+                existing_report.created_at = datetime(2025, 1, 1, 0, 0, 0)
+                existing_report.updated_at = datetime(2025, 1, 1, 0, 0, 0)
+            categories = [
+                Category(name="Step10 Category A", icon="a", display_order=10, is_active=True),
+                Category(name="Step10 Category B", icon="b", display_order=11, is_active=True),
+                Category(name="Step10 Category C inactive", icon="c", display_order=12, is_active=False),
+            ]
+            areas = [
+                Area(name="Step10 Area A", display_order=10, is_active=True),
+                Area(name="Step10 Area B", display_order=11, is_active=True),
+                Area(name="Step10 Area C inactive", display_order=12, is_active=False),
+            ]
+            db.add_all(categories + areas)
+            db.flush()
+            for index, status_value in enumerate(statuses):
+                report = Report(
+                    tracking_code=f"YT360-S10{index:03d}",
+                    category_id=categories[index % 3].id,
+                    area_id=areas[index % 3].id,
+                    description=f"Step 10 controlled report {index}",
+                    status=status_value,
+                )
+                db.add(report)
+                db.flush()
+                report.created_at = dates[index]
+                report.updated_at = dates[index]
+            db.commit()
+            expected_total = (
+                db.query(Report)
+                .filter(Report.tracking_code.like("YT360-S10%"))
+                .count()
+            )
+
+        response = self.client.get(
+            "/api/admin/statistics",
+            params={"from_date": "2026-09-01", "to_date": "2026-09-30"},
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(expected_total, 12)
+        self.assertEqual(body["total_reports"], 12)
+        self.assertEqual(body["new_reports"], 3)
+        self.assertEqual(body["received_reports"], 2)
+        self.assertEqual(body["coordinating_reports"], 4)
+        self.assertEqual(body["resolved_reports"], 3)
+        self.assertEqual(body["out_of_scope_reports"], 0)
+        self.assertEqual({item["label"]: item["value"] for item in body["by_category"]}, {
+            "Step10 Category A": 4,
+            "Step10 Category B": 4,
+            "Step10 Category C inactive": 4,
+        })
+        self.assertEqual({item["label"]: item["value"] for item in body["by_area"]}, {
+            "Step10 Area A": 4,
+            "Step10 Area B": 4,
+            "Step10 Area C inactive": 4,
+        })
+
+        excel = self.client.get(
+            "/api/admin/statistics/export",
+            params={"from_date": "2026-09-01", "to_date": "2026-09-30"},
+            headers=headers,
+        )
+        self.assertEqual(excel.status_code, 200)
+        sheet_xml = self.read_xlsx_sheet_xml(excel.content)
+        self.assertEqual(sheet_xml.count("<row "), 13)
+        for code in ["YT360-S10000", "YT360-S10007", "YT360-S10008", "YT360-S10011"]:
+            self.assertIn(code, sheet_xml)
+
+    def read_xlsx_sheet_xml(self, content: bytes) -> str:
+        with ZipFile(BytesIO(content)) as workbook:
+            self.assertIn("xl/workbook.xml", workbook.namelist())
+            self.assertIn("xl/worksheets/sheet1.xml", workbook.namelist())
+            return workbook.read("xl/worksheets/sheet1.xml").decode("utf-8")
 
     def test_duplicate_receive_does_not_create_duplicate_history(self):
         report_id = self.report_id("YT360-AAAAAA")

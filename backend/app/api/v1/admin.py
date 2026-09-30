@@ -1,9 +1,13 @@
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta, timezone
+from io import BytesIO
 import json
 from pathlib import Path
+from urllib.parse import quote
+from xml.sax.saxutils import escape
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, selectinload
@@ -11,6 +15,7 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 from app.api.dependencies import require_roles
 from app.api.v1.auth import auth_user_out
 from app.core.config import settings
+from app.core.qr import build_qr_svg
 from app.core.security import hash_password
 from app.db.dependencies import get_db
 from app.models import Area, Attachment, AuditLog, Category, Report, ReportStatus, StatusHistory, User
@@ -22,10 +27,13 @@ from app.schemas.admin import (
     AdminCategoryOut,
     AdminDashboardOut,
     AdminMetricOut,
+    AdminQrOut,
     AdminReportDetailOut,
     AdminReportListItemOut,
     AdminReportListOut,
     AdminReportTransitionIn,
+    AdminStatisticBucketOut,
+    AdminStatisticsOut,
     AdminStatusHistoryOut,
     AdminUserCreateIn,
     AdminUserOut,
@@ -37,6 +45,7 @@ from app.schemas.admin import (
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 ADMIN_ROLES = {"ADMIN", "RECEIVER", "HANDLER"}
+VIETNAM_TZ = timezone(timedelta(hours=7))
 
 
 @router.get("/dashboard", response_model=AdminDashboardOut)
@@ -77,6 +86,113 @@ def admin_dashboard(
     )
 
 
+@router.get("/qr", response_model=AdminQrOut)
+def admin_qr(
+    user: User = Depends(require_roles("ADMIN")),
+) -> AdminQrOut:
+    _ = user
+    target_url = normalized_public_site_url()
+    return AdminQrOut(target_url=target_url, svg=build_qr_svg(target_url))
+
+
+@router.get("/qr/download")
+def download_admin_qr(
+    user: User = Depends(require_roles("ADMIN")),
+) -> Response:
+    _ = user
+    target_url = normalized_public_site_url()
+    return Response(
+        content=build_qr_svg(target_url),
+        media_type="image/svg+xml",
+        headers={
+            "Content-Disposition": "attachment; filename=YenTruong360_QR.svg",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@router.get("/statistics", response_model=AdminStatisticsOut)
+def admin_statistics(
+    user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
+    db: Session = Depends(get_db),
+    status: ReportStatus | None = None,
+    category_id: int | None = Query(default=None, ge=1),
+    area_id: int | None = Query(default=None, ge=1),
+    from_date: date | None = None,
+    to_date: date | None = None,
+) -> AdminStatisticsOut:
+    _ = user
+    filters = build_report_filters(
+        status=status,
+        category_id=category_id,
+        area_id=area_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    return build_statistics_out(db, filters)
+
+
+@router.get("/statistics/export")
+def export_admin_statistics_excel(
+    user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
+    db: Session = Depends(get_db),
+    status: ReportStatus | None = None,
+    category_id: int | None = Query(default=None, ge=1),
+    area_id: int | None = Query(default=None, ge=1),
+    from_date: date | None = None,
+    to_date: date | None = None,
+) -> Response:
+    _ = user
+    filters = build_report_filters(
+        status=status,
+        category_id=category_id,
+        area_id=area_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
+    statement = (
+        select(Report)
+        .options(joinedload(Report.category), joinedload(Report.area))
+        .order_by(Report.created_at.desc(), Report.id.desc())
+    )
+    if filters:
+        statement = statement.where(*filters)
+
+    rows = [
+        [
+            index,
+            report.tracking_code,
+            format_export_datetime(report.created_at),
+            report.category.name,
+            report.area.name if report.area else "Chưa xác định",
+            report_status_label(report.status),
+            format_export_datetime(report.updated_at),
+        ]
+        for index, report in enumerate(db.scalars(statement).all(), start=1)
+    ]
+    content = build_xlsx_bytes(
+        headers=[
+            "STT",
+            "Mã phản ánh",
+            "Ngày tiếp nhận",
+            "Nhóm",
+            "Khu vực",
+            "Trạng thái",
+            "Cập nhật gần nhất",
+        ],
+        rows=rows,
+    )
+    filename = f"YenTruong360_ThongKe_{date.today().isoformat()}.xlsx"
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}; filename*=UTF-8''{quote(filename)}",
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.get("/reports", response_model=AdminReportListOut)
 def list_reports(
     user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
@@ -93,19 +209,14 @@ def list_reports(
     sort_order: str = Query(default="desc", pattern="^(asc|desc)$"),
 ) -> AdminReportListOut:
     _ = user
-    filters = []
-    if tracking_code:
-        filters.append(Report.tracking_code.ilike(f"%{tracking_code.strip().upper()}%"))
-    if status:
-        filters.append(Report.status == status)
-    if category_id:
-        filters.append(Report.category_id == category_id)
-    if area_id:
-        filters.append(Report.area_id == area_id)
-    if from_date:
-        filters.append(Report.created_at >= datetime.combine(from_date, time.min))
-    if to_date:
-        filters.append(Report.created_at <= datetime.combine(to_date, time.max))
+    filters = build_report_filters(
+        tracking_code=tracking_code,
+        status=status,
+        category_id=category_id,
+        area_id=area_id,
+        from_date=from_date,
+        to_date=to_date,
+    )
 
     total_statement = select(func.count()).select_from(Report)
     if filters:
@@ -543,6 +654,203 @@ def handler_work(user: User = Depends(require_roles("ADMIN", "HANDLER"))) -> dic
 
 def _count_status(db: Session, status: ReportStatus) -> int:
     return db.scalar(select(func.count()).select_from(Report).where(Report.status == status)) or 0
+
+
+def normalized_public_site_url() -> str:
+    target_url = settings.public_site_url.strip().rstrip("/")
+    if not target_url:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PUBLIC_SITE_URL chua duoc cau hinh.",
+        )
+    if not target_url.startswith(("https://", "http://")):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="PUBLIC_SITE_URL khong hop le.",
+        )
+    return target_url
+
+
+def build_report_filters(
+    *,
+    tracking_code: str | None = None,
+    status: ReportStatus | None = None,
+    category_id: int | None = None,
+    area_id: int | None = None,
+    from_date: date | None = None,
+    to_date: date | None = None,
+) -> list:
+    filters = []
+    if tracking_code:
+        filters.append(Report.tracking_code.ilike(f"%{tracking_code.strip().upper()}%"))
+    if status:
+        filters.append(Report.status == status)
+    if category_id:
+        filters.append(Report.category_id == category_id)
+    if area_id:
+        filters.append(Report.area_id == area_id)
+    if from_date:
+        filters.append(Report.created_at >= vietnam_day_to_utc_naive(from_date, time.min))
+    if to_date:
+        filters.append(Report.created_at <= vietnam_day_to_utc_naive(to_date, time.max))
+    return filters
+
+
+def build_statistics_out(db: Session, filters: list) -> AdminStatisticsOut:
+    def count_for(status_value: ReportStatus | None = None) -> int:
+        statement = select(func.count()).select_from(Report)
+        if filters:
+            statement = statement.where(*filters)
+        if status_value:
+            statement = statement.where(Report.status == status_value)
+        return db.scalar(statement) or 0
+
+    category_statement = (
+        select(Category.id, Category.name, func.count(Report.id))
+        .join(Report, Report.category_id == Category.id)
+        .group_by(Category.id, Category.name)
+        .order_by(func.count(Report.id).desc(), Category.display_order.asc(), Category.id.asc())
+    )
+    if filters:
+        category_statement = category_statement.where(*filters)
+
+    area_statement = (
+        select(Area.id, Area.name, func.count(Report.id))
+        .join(Report, Report.area_id == Area.id)
+        .group_by(Area.id, Area.name)
+        .order_by(func.count(Report.id).desc(), Area.display_order.asc(), Area.id.asc())
+    )
+    if filters:
+        area_statement = area_statement.where(*filters)
+
+    local_report_day = func.date(Report.created_at, "+7 hours")
+    date_statement = (
+        select(local_report_day, func.count(Report.id))
+        .select_from(Report)
+        .group_by(local_report_day)
+        .order_by(local_report_day.asc())
+    )
+    if filters:
+        date_statement = date_statement.where(*filters)
+
+    return AdminStatisticsOut(
+        total_reports=count_for(),
+        new_reports=count_for(ReportStatus.NEW),
+        received_reports=count_for(ReportStatus.RECEIVED),
+        coordinating_reports=count_for(ReportStatus.COORDINATING),
+        resolved_reports=count_for(ReportStatus.RESOLVED),
+        out_of_scope_reports=count_for(ReportStatus.OUT_OF_SCOPE),
+        by_category=[
+            AdminStatisticBucketOut(key=str(category_id), label=name, value=count)
+            for category_id, name, count in db.execute(category_statement).all()
+        ],
+        by_area=[
+            AdminStatisticBucketOut(key=str(area_id), label=name, value=count)
+            for area_id, name, count in db.execute(area_statement).all()
+        ],
+        by_date=[
+            AdminStatisticBucketOut(key=str(day), label=format_statistics_day(day), value=count)
+            for day, count in db.execute(date_statement).all()
+        ],
+    )
+
+
+def report_status_label(status_value: ReportStatus) -> str:
+    labels = {
+        ReportStatus.NEW: "Mới",
+        ReportStatus.RECEIVED: "Đã tiếp nhận",
+        ReportStatus.COORDINATING: "Đang phối hợp",
+        ReportStatus.RESOLVED: "Đã xử lý",
+        ReportStatus.OUT_OF_SCOPE: "Không thuộc phạm vi",
+    }
+    return labels.get(status_value, status_value.value)
+
+
+def format_statistics_day(value: object) -> str:
+    raw_value = str(value)
+    try:
+        parsed = date.fromisoformat(raw_value)
+    except ValueError:
+        return raw_value
+    return parsed.strftime("%d/%m/%Y")
+
+
+def format_export_datetime(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(VIETNAM_TZ).strftime("%d/%m/%Y %H:%M")
+
+
+def vietnam_day_to_utc_naive(day: date, day_time: time) -> datetime:
+    local_value = datetime.combine(day, day_time).replace(tzinfo=VIETNAM_TZ)
+    return local_value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def build_xlsx_bytes(*, headers: list[str], rows: list[list[object]]) -> bytes:
+    worksheet_xml = build_worksheet_xml(headers, rows)
+    buffer = BytesIO()
+    with ZipFile(buffer, "w", ZIP_DEFLATED) as workbook:
+        workbook.writestr(
+            "[Content_Types].xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>""",
+        )
+        workbook.writestr(
+            "_rels/.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>""",
+        )
+        workbook.writestr(
+            "xl/workbook.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="ThongKe" sheetId="1" r:id="rId1"/></sheets></workbook>""",
+        )
+        workbook.writestr(
+            "xl/_rels/workbook.xml.rels",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>""",
+        )
+        workbook.writestr(
+            "xl/styles.xml",
+            """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>""",
+        )
+        workbook.writestr("xl/worksheets/sheet1.xml", worksheet_xml)
+    return buffer.getvalue()
+
+
+def build_worksheet_xml(headers: list[str], rows: list[list[object]]) -> str:
+    all_rows = [headers, *rows]
+    xml_rows = []
+    for row_index, row in enumerate(all_rows, start=1):
+        cells = []
+        for column_index, value in enumerate(row, start=1):
+            coordinate = f"{excel_column_name(column_index)}{row_index}"
+            style = ' s="1"' if row_index == 1 else ""
+            if isinstance(value, int):
+                cells.append(f'<c r="{coordinate}"{style}><v>{value}</v></c>')
+            else:
+                cells.append(
+                    f'<c r="{coordinate}" t="inlineStr"{style}><is><t>{escape(str(value or ""))}</t></is></c>'
+                )
+        xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<cols><col min="1" max="1" width="8" customWidth="1"/><col min="2" max="7" width="24" customWidth="1"/></cols>'
+        f'<sheetData>{"".join(xml_rows)}</sheetData>'
+        "</worksheet>"
+    )
+
+
+def excel_column_name(index: int) -> str:
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
 
 
 def load_category_or_404(db: Session, category_id: int) -> Category:

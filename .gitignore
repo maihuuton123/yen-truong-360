@@ -27,6 +27,7 @@ frontend/dist/
 .ruff_cache/
 .coverage
 htmlcov/
+.acceptance_clean/
 
 # OS / editors
 .DS_Store

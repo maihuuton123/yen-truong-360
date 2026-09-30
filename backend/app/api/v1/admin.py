@@ -833,7 +833,7 @@ def build_worksheet_xml(headers: list[str], rows: list[list[object]]) -> str:
                 cells.append(f'<c r="{coordinate}"{style}><v>{value}</v></c>')
             else:
                 cells.append(
-                    f'<c r="{coordinate}" t="inlineStr"{style}><is><t>{escape(str(value or ""))}</t></is></c>'
+                    f'<c r="{coordinate}" t="inlineStr"{style}><is><t>{escape(sanitize_excel_text(value))}</t></is></c>'
                 )
         xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
     return (
@@ -851,6 +851,13 @@ def excel_column_name(index: int) -> str:
         index, remainder = divmod(index - 1, 26)
         name = chr(65 + remainder) + name
     return name
+
+
+def sanitize_excel_text(value: object) -> str:
+    text = str(value or "")
+    if text.startswith(("=", "+", "-", "@")):
+        return f"'{text}"
+    return text
 
 
 def load_category_or_404(db: Session, category_id: int) -> Category:

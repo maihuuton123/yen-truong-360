@@ -5,15 +5,21 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import FileResponse
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.api.dependencies import require_roles
 from app.api.v1.auth import auth_user_out
 from app.core.config import settings
+from app.core.security import hash_password
 from app.db.dependencies import get_db
-from app.models import Attachment, AuditLog, Report, ReportStatus, StatusHistory, User
+from app.models import Area, Attachment, AuditLog, Category, Report, ReportStatus, StatusHistory, User
 from app.schemas.admin import (
+    AdminAreaIn,
+    AdminAreaOut,
     AdminAttachmentOut,
+    AdminCategoryIn,
+    AdminCategoryOut,
     AdminDashboardOut,
     AdminMetricOut,
     AdminReportDetailOut,
@@ -21,11 +27,16 @@ from app.schemas.admin import (
     AdminReportListOut,
     AdminReportTransitionIn,
     AdminStatusHistoryOut,
+    AdminUserCreateIn,
+    AdminUserOut,
+    AdminUserPasswordIn,
+    AdminUserUpdateIn,
     AdminWorkSummaryOut,
 )
 
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+ADMIN_ROLES = {"ADMIN", "RECEIVER", "HANDLER"}
 
 
 @router.get("/dashboard", response_model=AdminDashboardOut)
@@ -138,6 +149,274 @@ def get_report_detail(
 ) -> AdminReportDetailOut:
     _ = user
     return report_detail_out(load_report_or_404(db, report_id))
+
+
+@router.get("/categories", response_model=list[AdminCategoryOut])
+def list_admin_categories(
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> list[AdminCategoryOut]:
+    _ = user
+    categories = db.scalars(select(Category).order_by(Category.display_order, Category.id)).all()
+    return [category_out(db, category) for category in categories]
+
+
+@router.post("/categories", response_model=AdminCategoryOut, status_code=status.HTTP_201_CREATED)
+def create_admin_category(
+    payload: AdminCategoryIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminCategoryOut:
+    name = require_clean_name(payload.name, "Tên nhóm phản ánh là bắt buộc.")
+    category = Category(
+        name=name,
+        icon=clean_text(payload.icon),
+        is_active=payload.is_active,
+        display_order=payload.display_order,
+    )
+    try:
+        db.add(category)
+        db.flush()
+        add_catalog_audit_log(
+            db,
+            user=user,
+            action="CATEGORY_CREATE",
+            entity_type="category",
+            entity_id=category.id,
+            before=None,
+            after=catalog_snapshot(category),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tên nhóm phản ánh đã tồn tại.") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return category_out(db, category)
+
+
+@router.put("/categories/{category_id}", response_model=AdminCategoryOut)
+def update_admin_category(
+    category_id: int,
+    payload: AdminCategoryIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminCategoryOut:
+    category = load_category_or_404(db, category_id)
+    before = catalog_snapshot(category)
+    category.name = require_clean_name(payload.name, "Tên nhóm phản ánh là bắt buộc.")
+    category.icon = clean_text(payload.icon)
+    category.is_active = payload.is_active
+    category.display_order = payload.display_order
+    try:
+        db.flush()
+        add_catalog_audit_log(
+            db,
+            user=user,
+            action="CATEGORY_UPDATE",
+            entity_type="category",
+            entity_id=category.id,
+            before=before,
+            after=catalog_snapshot(category),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tên nhóm phản ánh đã tồn tại.") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return category_out(db, category)
+
+
+@router.get("/areas", response_model=list[AdminAreaOut])
+def list_admin_areas(
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> list[AdminAreaOut]:
+    _ = user
+    areas = db.scalars(select(Area).order_by(Area.display_order, Area.id)).all()
+    return [area_out(db, area) for area in areas]
+
+
+@router.post("/areas", response_model=AdminAreaOut, status_code=status.HTTP_201_CREATED)
+def create_admin_area(
+    payload: AdminAreaIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminAreaOut:
+    name = require_clean_name(payload.name, "Tên khu vực là bắt buộc.")
+    area = Area(name=name, is_active=payload.is_active, display_order=payload.display_order)
+    try:
+        db.add(area)
+        db.flush()
+        add_catalog_audit_log(
+            db,
+            user=user,
+            action="AREA_CREATE",
+            entity_type="area",
+            entity_id=area.id,
+            before=None,
+            after=catalog_snapshot(area),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tên khu vực đã tồn tại.") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return area_out(db, area)
+
+
+@router.put("/areas/{area_id}", response_model=AdminAreaOut)
+def update_admin_area(
+    area_id: int,
+    payload: AdminAreaIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminAreaOut:
+    area = load_area_or_404(db, area_id)
+    before = catalog_snapshot(area)
+    area.name = require_clean_name(payload.name, "Tên khu vực là bắt buộc.")
+    area.is_active = payload.is_active
+    area.display_order = payload.display_order
+    try:
+        db.flush()
+        add_catalog_audit_log(
+            db,
+            user=user,
+            action="AREA_UPDATE",
+            entity_type="area",
+            entity_id=area.id,
+            before=before,
+            after=catalog_snapshot(area),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tên khu vực đã tồn tại.") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return area_out(db, area)
+
+
+@router.get("/users", response_model=list[AdminUserOut])
+def list_admin_users(
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> list[AdminUserOut]:
+    _ = user
+    users = db.scalars(select(User).order_by(User.id)).all()
+    return [admin_user_out(item) for item in users]
+
+
+@router.post("/users", response_model=AdminUserOut, status_code=status.HTTP_201_CREATED)
+def create_admin_user(
+    payload: AdminUserCreateIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminUserOut:
+    username = require_clean_username(payload.username)
+    full_name = require_clean_name(payload.full_name, "Tên cán bộ là bắt buộc.")
+    role = require_admin_role(payload.role)
+    target = User(
+        username=username,
+        password_hash=hash_password(payload.password),
+        full_name=full_name,
+        role=role,
+        is_active=payload.is_active,
+    )
+    try:
+        db.add(target)
+        db.flush()
+        add_user_audit_log(
+            db,
+            user=user,
+            action="USER_CREATE",
+            target=target,
+            before=None,
+            after=user_snapshot(target),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Tên đăng nhập đã tồn tại.") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return admin_user_out(target)
+
+
+@router.put("/users/{user_id}", response_model=AdminUserOut)
+def update_admin_user(
+    user_id: int,
+    payload: AdminUserUpdateIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminUserOut:
+    target = load_user_or_404(db, user_id)
+    full_name = require_clean_name(payload.full_name, "Tên cán bộ là bắt buộc.")
+    role = require_admin_role(payload.role)
+    ensure_admin_account_change_is_safe(db, acting_user=user, target=target, next_role=role, next_is_active=payload.is_active)
+    before = user_snapshot(target)
+    target.full_name = full_name
+    target.role = role
+    target.is_active = payload.is_active
+    try:
+        db.flush()
+        add_user_audit_log(
+            db,
+            user=user,
+            action="USER_UPDATE",
+            target=target,
+            before=before,
+            after=user_snapshot(target),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Không cập nhật được tài khoản.") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return admin_user_out(target)
+
+
+@router.post("/users/{user_id}/password", response_model=AdminUserOut)
+def reset_admin_user_password(
+    user_id: int,
+    payload: AdminUserPasswordIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminUserOut:
+    target = load_user_or_404(db, user_id)
+    before = user_snapshot(target)
+    target.password_hash = hash_password(payload.password)
+    try:
+        db.flush()
+        add_user_audit_log(
+            db,
+            user=user,
+            action="USER_PASSWORD_RESET",
+            target=target,
+            before=before,
+            after=user_snapshot(target),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    return admin_user_out(target)
 
 
 @router.get("/reports/{report_id}/attachments/{attachment_id}")
@@ -266,6 +545,115 @@ def _count_status(db: Session, status: ReportStatus) -> int:
     return db.scalar(select(func.count()).select_from(Report).where(Report.status == status)) or 0
 
 
+def load_category_or_404(db: Session, category_id: int) -> Category:
+    category = db.get(Category, category_id)
+    if category is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Không tìm thấy nhóm phản ánh.")
+    return category
+
+
+def load_area_or_404(db: Session, area_id: int) -> Area:
+    area = db.get(Area, area_id)
+    if area is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Không tìm thấy khu vực.")
+    return area
+
+
+def category_out(db: Session, category: Category) -> AdminCategoryOut:
+    report_count = db.scalar(select(func.count()).select_from(Report).where(Report.category_id == category.id)) or 0
+    return AdminCategoryOut(
+        id=category.id,
+        name=category.name,
+        icon=category.icon,
+        is_active=category.is_active,
+        display_order=category.display_order,
+        report_count=report_count,
+    )
+
+
+def area_out(db: Session, area: Area) -> AdminAreaOut:
+    report_count = db.scalar(select(func.count()).select_from(Report).where(Report.area_id == area.id)) or 0
+    return AdminAreaOut(
+        id=area.id,
+        name=area.name,
+        is_active=area.is_active,
+        display_order=area.display_order,
+        report_count=report_count,
+    )
+
+
+def load_user_or_404(db: Session, user_id: int) -> User:
+    target = db.get(User, user_id)
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Không tìm thấy tài khoản cán bộ.")
+    return target
+
+
+def admin_user_out(user: User) -> AdminUserOut:
+    return AdminUserOut(
+        id=user.id,
+        username=user.username,
+        full_name=user.full_name,
+        role=user.role,
+        is_active=user.is_active,
+        created_at=user.created_at,
+    )
+
+
+def require_clean_username(value: str) -> str:
+    cleaned = value.strip().lower()
+    if not cleaned:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Tên đăng nhập là bắt buộc.")
+    if not cleaned.replace("_", "").replace("-", "").isalnum():
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Tên đăng nhập chỉ được gồm chữ, số, dấu gạch dưới hoặc gạch ngang.",
+        )
+    return cleaned
+
+
+def require_admin_role(value: str) -> str:
+    role = value.strip().upper()
+    if role not in ADMIN_ROLES:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Vai trò tài khoản không hợp lệ.")
+    return role
+
+
+def ensure_admin_account_change_is_safe(
+    db: Session,
+    *,
+    acting_user: User,
+    target: User,
+    next_role: str,
+    next_is_active: bool,
+) -> None:
+    if target.id == acting_user.id and (not next_is_active or next_role != "ADMIN"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Không thể tự khóa hoặc hạ quyền tài khoản đang đăng nhập.",
+        )
+
+    target_stops_being_active_admin = target.role == "ADMIN" and target.is_active and (
+        not next_is_active or next_role != "ADMIN"
+    )
+    if not target_stops_being_active_admin:
+        return
+
+    active_admin_count = (
+        db.scalar(
+            select(func.count())
+            .select_from(User)
+            .where(User.role == "ADMIN", User.is_active.is_(True))
+        )
+        or 0
+    )
+    if active_admin_count <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Không thể khóa hoặc hạ quyền ADMIN cuối cùng.",
+        )
+
+
 def load_report_or_404(db: Session, report_id: int) -> Report:
     report = db.scalar(
         select(Report)
@@ -366,6 +754,76 @@ def add_audit_log(
             details=json.dumps(details, ensure_ascii=False),
         )
     )
+
+
+def add_catalog_audit_log(
+    db: Session,
+    *,
+    user: User,
+    action: str,
+    entity_type: str,
+    entity_id: int,
+    before: dict[str, object] | None,
+    after: dict[str, object],
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action=action,
+            entity_type=entity_type,
+            entity_id=entity_id,
+            details=json.dumps({"before": before, "after": after}, ensure_ascii=False),
+        )
+    )
+
+
+def add_user_audit_log(
+    db: Session,
+    *,
+    user: User,
+    action: str,
+    target: User,
+    before: dict[str, object] | None,
+    after: dict[str, object],
+) -> None:
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action=action,
+            entity_type="user",
+            entity_id=target.id,
+            details=json.dumps({"before": before, "after": after}, ensure_ascii=False),
+        )
+    )
+
+
+def catalog_snapshot(item: Category | Area) -> dict[str, object]:
+    snapshot: dict[str, object] = {
+        "id": item.id,
+        "name": item.name,
+        "is_active": item.is_active,
+        "display_order": item.display_order,
+    }
+    if isinstance(item, Category):
+        snapshot["icon"] = item.icon
+    return snapshot
+
+
+def user_snapshot(user: User) -> dict[str, object]:
+    return {
+        "id": user.id,
+        "username": user.username,
+        "full_name": user.full_name,
+        "role": user.role,
+        "is_active": user.is_active,
+    }
+
+
+def require_clean_name(value: str, message: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=message)
+    return cleaned
 
 
 def clean_text(value: str | None) -> str | None:

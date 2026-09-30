@@ -82,3 +82,60 @@ class AdminReportTransitionIn(BaseModel):
     internal_note: str | None = Field(default=None, max_length=2000)
     public_note: str | None = Field(default=None, max_length=2000)
     coordination_target: str | None = Field(default=None, max_length=300)
+
+
+class AdminCategoryIn(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    icon: str | None = Field(default=None, max_length=80)
+    is_active: bool = True
+    display_order: int = Field(default=0, ge=0, le=100000)
+
+
+class AdminCategoryOut(BaseModel):
+    id: int
+    name: str
+    icon: str | None
+    is_active: bool
+    display_order: int
+    report_count: int
+
+
+class AdminAreaIn(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    is_active: bool = True
+    display_order: int = Field(default=0, ge=0, le=100000)
+
+
+class AdminAreaOut(BaseModel):
+    id: int
+    name: str
+    is_active: bool
+    display_order: int
+    report_count: int
+
+
+class AdminUserCreateIn(BaseModel):
+    username: str = Field(min_length=3, max_length=80)
+    password: str = Field(min_length=8, max_length=128)
+    full_name: str = Field(min_length=1, max_length=150)
+    role: str = Field(max_length=50)
+    is_active: bool = True
+
+
+class AdminUserUpdateIn(BaseModel):
+    full_name: str = Field(min_length=1, max_length=150)
+    role: str = Field(max_length=50)
+    is_active: bool = True
+
+
+class AdminUserPasswordIn(BaseModel):
+    password: str = Field(min_length=8, max_length=128)
+
+
+class AdminUserOut(BaseModel):
+    id: int
+    username: str
+    full_name: str
+    role: str
+    is_active: bool
+    created_at: datetime

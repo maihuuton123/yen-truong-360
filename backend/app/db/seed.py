@@ -1,6 +1,6 @@
 import os
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -34,48 +34,39 @@ def require_admin_password() -> str:
 
 
 def seed_categories(db: Session) -> None:
-    for index, (name, icon) in enumerate(CATEGORIES, start=1):
-        category = db.scalar(select(Category).where(Category.name == name))
-        if category is None:
-            db.add(Category(name=name, icon=icon, display_order=index, is_active=True))
-            continue
+    existing_count = db.scalar(select(func.count()).select_from(Category)) or 0
+    if existing_count > 0:
+        return
 
-        category.icon = icon
-        category.display_order = index
-        category.is_active = True
+    for index, (name, icon) in enumerate(CATEGORIES, start=1):
+        db.add(Category(name=name, icon=icon, display_order=index, is_active=True))
 
 
 def seed_areas(db: Session) -> None:
-    for index, name in enumerate(DEMO_AREAS, start=1):
-        area = db.scalar(select(Area).where(Area.name == name))
-        if area is None:
-            db.add(Area(name=name, display_order=index, is_active=True))
-            continue
+    existing_count = db.scalar(select(func.count()).select_from(Area)) or 0
+    if existing_count > 0:
+        return
 
-        area.display_order = index
-        area.is_active = True
+    for index, name in enumerate(DEMO_AREAS, start=1):
+        db.add(Area(name=name, display_order=index, is_active=True))
 
 
 def seed_admin(db: Session) -> None:
-    password = require_admin_password()
     user = db.scalar(select(User).where(User.username == settings.admin_username))
 
-    if user is None:
-        db.add(
-            User(
-                username=settings.admin_username,
-                password_hash=hash_password(password),
-                full_name="Quản trị phát triển",
-                role="ADMIN",
-                is_active=True,
-            )
-        )
+    if user is not None:
         return
 
-    user.password_hash = hash_password(password)
-    user.full_name = "Quản trị phát triển"
-    user.role = "ADMIN"
-    user.is_active = True
+    password = require_admin_password()
+    db.add(
+        User(
+            username=settings.admin_username,
+            password_hash=hash_password(password),
+            full_name="Quản trị phát triển",
+            role="ADMIN",
+            is_active=True,
+        )
+    )
 
 
 def seed_database() -> None:

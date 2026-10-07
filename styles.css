@@ -1313,7 +1313,8 @@ input[type="file"]:focus {
 
 .report-detail-card,
 .report-action-card,
-.history-card {
+.history-card,
+.technical-card {
   display: grid;
   gap: 18px;
 }
@@ -1376,6 +1377,75 @@ input[type="file"]:focus {
 .danger-action {
   color: #8c1f1f;
   border-color: #edb1b1;
+}
+
+.technical-card details {
+  display: grid;
+  gap: 16px;
+}
+
+.technical-card summary {
+  display: grid;
+  gap: 4px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.technical-card summary::-webkit-details-marker {
+  display: none;
+}
+
+.technical-card summary strong {
+  color: #14211a;
+  font-size: 22px;
+  line-height: 1.16;
+}
+
+.technical-card summary::after {
+  content: "Mở rộng";
+  justify-self: start;
+  border: 1px solid #b9cbc1;
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: #172820;
+  background: #ffffff;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.technical-card details[open] summary::after {
+  content: "Thu gọn";
+}
+
+.technical-metadata-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.technical-metadata-list div {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #d7e3dc;
+  border-radius: 8px;
+  padding: 14px;
+  background: #f9fcfa;
+}
+
+.technical-metadata-list dt {
+  color: #637268;
+  font-size: 13px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.technical-metadata-list dd {
+  margin: 0;
+  color: #172820;
+  font-size: 15px;
+  font-weight: 750;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 .admin-history-list {

@@ -1,0 +1,36 @@
+
+from app.models.report import (
+    AdditionalInfoRequest,
+    AdditionalInfoRequestStatus,
+    Area,
+    Attachment,
+    AuditLog,
+    Category,
+    Notification,
+    NotificationStatus,
+    Report,
+    ReportAssignmentHistory,
+    ReportInternalNote,
+    ReportPriority,
+    ReportStatus,
+    StatusHistory,
+    User,
+)
+
+__all__ = [
+    "AdditionalInfoRequest",
+    "AdditionalInfoRequestStatus",
+    "Area",
+    "Attachment",
+    "AuditLog",
+    "Category",
+    "Notification",
+    "NotificationStatus",
+    "Report",
+    "ReportAssignmentHistory",
+    "ReportInternalNote",
+    "ReportPriority",
+    "ReportStatus",
+    "StatusHistory",
+    "User",
+]

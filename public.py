@@ -8,9 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
+from app.core.anti_spam import assess_public_report_submission
 from app.core.config import settings
 from app.core.client_metadata import collect_report_technical_metadata
-from app.core.rate_limit import limit_public_lookup_requests, limit_public_report_requests
+from app.core.rate_limit import limit_public_lookup_requests
 from app.db.dependencies import get_db
 from app.models import Area, Attachment, Category, Report, ReportStatus
 from app.schemas.public import (
@@ -77,7 +78,6 @@ def get_public_areas(db: Session = Depends(get_db)) -> list[Area]:
     "/reports",
     response_model=PublicReportCreatedOut,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(limit_public_report_requests)],
 )
 async def create_public_report(
     request: Request,
@@ -91,8 +91,17 @@ async def create_public_report(
     category = get_active_category(db, category_id)
     area = get_active_area(db, area_id)
 
-    attachment_data = await prepare_image_upload(image) if image is not None else None
     technical_metadata = collect_report_technical_metadata(request)
+    spam_assessment = assess_public_report_submission(db, technical_metadata)
+    technical_payload = dict(technical_metadata.technical_metadata)
+    technical_payload["anti_spam"] = {
+        "ip_window_count": spam_assessment.ip_window_count,
+        "rapid_window_count": spam_assessment.rapid_window_count,
+        "captcha_required": spam_assessment.captcha_required,
+        "captcha_provider_enabled": spam_assessment.captcha_provider_enabled,
+        "captcha_note": "CAPTCHA hook only; no provider is enforced unless configured.",
+    }
+    attachment_data = await prepare_image_upload(image) if image is not None else None
 
     report = Report(
         tracking_code=generate_unique_tracking_code(db),
@@ -104,7 +113,11 @@ async def create_public_report(
         reporter_user_agent_hash=technical_metadata.reporter_user_agent_hash,
         request_fingerprint_hash=technical_metadata.request_fingerprint_hash,
         client_submitted_at=technical_metadata.observed_at,
-        technical_metadata=json.dumps(technical_metadata.technical_metadata, ensure_ascii=False),
+        technical_metadata=json.dumps(technical_payload, ensure_ascii=False),
+        is_spam=spam_assessment.is_spam,
+        spam_score=spam_assessment.spam_score,
+        spam_reason=spam_assessment.spam_reason,
+        moderation_status=spam_assessment.moderation_status,
     )
     db.add(report)
     db.flush()

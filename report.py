@@ -95,6 +95,14 @@ class User(Base):
 
     status_changes: Mapped[list["StatusHistory"]] = relationship(back_populates="changed_by_user")
     audit_logs: Mapped[list["AuditLog"]] = relationship(back_populates="user")
+    source_blocks_created: Mapped[list["ReportSourceBlock"]] = relationship(
+        back_populates="created_by_user",
+        foreign_keys="ReportSourceBlock.created_by",
+    )
+    source_blocks_lifted: Mapped[list["ReportSourceBlock"]] = relationship(
+        back_populates="lifted_by_user",
+        foreign_keys="ReportSourceBlock.lifted_by",
+    )
     assigned_reports: Mapped[list["Report"]] = relationship(back_populates="assigned_to_user")
     assignment_changes: Mapped[list["ReportAssignmentHistory"]] = relationship(
         back_populates="changed_by_user",
@@ -373,4 +381,33 @@ class AuditLog(Base):
 
     __table_args__ = (
         Index("ix_audit_logs_entity", "entity_type", "entity_id"),
+    )
+
+
+class ReportSourceBlock(Base):
+    __tablename__ = "report_source_blocks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    source_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true(), index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    lifted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    lifted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    created_by_user: Mapped[User | None] = relationship(
+        back_populates="source_blocks_created",
+        foreign_keys=[created_by],
+    )
+    lifted_by_user: Mapped[User | None] = relationship(
+        back_populates="source_blocks_lifted",
+        foreign_keys=[lifted_by],
+    )
+
+    __table_args__ = (
+        Index("ix_report_source_blocks_source_active", "source_type", "source_hash", "is_active"),
     )

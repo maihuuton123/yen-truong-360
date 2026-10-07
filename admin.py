@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -131,6 +131,26 @@ class AdminReportTechnicalOut(BaseModel):
     request_fingerprint_hash: str | None
     client_submitted_at: datetime | None
     technical_metadata: dict[str, Any] | None
+    active_source_blocks: list["AdminReportSourceBlockOut"] = Field(default_factory=list)
+
+
+class AdminReportSourceBlockIn(BaseModel):
+    source_type: Literal["IP", "FINGERPRINT"] = "FINGERPRINT"
+    reason: str | None = Field(default=None, max_length=500)
+    expires_at: datetime | None = None
+
+
+class AdminReportSourceBlockOut(BaseModel):
+    id: int
+    source_type: str
+    source_hash: str
+    reason: str | None
+    is_active: bool
+    expires_at: datetime | None
+    lifted_at: datetime | None
+    created_at: datetime
+    created_by: AuthUserOut | None
+    lifted_by: AuthUserOut | None
 
 
 class AdminReportTransitionIn(BaseModel):

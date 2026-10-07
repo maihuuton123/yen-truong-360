@@ -16,11 +16,16 @@ class Settings(BaseSettings):
     upload_dir: str = Field(default="./uploads/reports", alias="UPLOAD_DIR")
     public_site_url: str = Field(default="http://localhost:5173", alias="PUBLIC_SITE_URL")
     max_upload_bytes: int = Field(default=5 * 1024 * 1024, alias="MAX_UPLOAD_BYTES")
-    public_report_rate_limit: int = Field(default=10, alias="PUBLIC_REPORT_RATE_LIMIT")
+    public_report_rate_limit: int = Field(default=60, alias="PUBLIC_REPORT_RATE_LIMIT")
     public_report_rate_limit_window_seconds: int = Field(
         default=60,
         alias="PUBLIC_REPORT_RATE_LIMIT_WINDOW_SECONDS",
     )
+    public_report_rapid_limit: int = Field(default=3, alias="PUBLIC_REPORT_RAPID_LIMIT")
+    public_report_rapid_window_seconds: int = Field(default=10, alias="PUBLIC_REPORT_RAPID_WINDOW_SECONDS")
+    public_report_spam_flag_threshold: int = Field(default=3, alias="PUBLIC_REPORT_SPAM_FLAG_THRESHOLD")
+    public_report_captcha_risk_threshold: float = Field(default=0.7, alias="PUBLIC_REPORT_CAPTCHA_RISK_THRESHOLD")
+    captcha_provider_enabled: bool = Field(default=False, alias="CAPTCHA_PROVIDER_ENABLED")
     public_lookup_rate_limit: int = Field(default=30, alias="PUBLIC_LOOKUP_RATE_LIMIT")
     public_lookup_rate_limit_window_seconds: int = Field(
         default=60,

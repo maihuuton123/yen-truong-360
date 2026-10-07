@@ -1448,6 +1448,38 @@ input[type="file"]:focus {
   white-space: pre-wrap;
 }
 
+.source-block-panel {
+  display: grid;
+  gap: 12px;
+  border: 1px solid #e6c3c3;
+  border-radius: 8px;
+  padding: 14px;
+  background: #fffafa;
+}
+
+.source-block-panel span {
+  display: block;
+  color: #7a5e5e;
+  font-size: 13px;
+  font-weight: 950;
+  text-transform: uppercase;
+}
+
+.source-block-panel strong {
+  color: #172820;
+  font-size: 17px;
+  font-weight: 900;
+}
+
+.source-block-panel ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding-left: 18px;
+  color: #4f5f56;
+  font-weight: 750;
+}
+
 .admin-history-list {
   display: grid;
   gap: 12px;

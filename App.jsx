@@ -369,6 +369,26 @@ async function fetchAdminReportDetail(token, reportId) {
   return fetchWithAuth(`/api/admin/reports/${encodeURIComponent(reportId)}`, token);
 }
 
+async function fetchAdminReportTechnical(token, reportId) {
+  return fetchWithAuth(`/api/admin/reports/${encodeURIComponent(reportId)}/technical`, token);
+}
+
+async function blockAdminReportSource(token, reportId, sourceType, reason) {
+  return fetchWithAuth(`/api/admin/reports/${encodeURIComponent(reportId)}/source-blocks`, token, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ source_type: sourceType, reason }),
+  });
+}
+
+async function unblockAdminReportSource(token, blockId) {
+  return fetchWithAuth(`/api/admin/source-blocks/${encodeURIComponent(blockId)}/unblock`, token, {
+    method: "POST",
+  });
+}
+
 async function transitionAdminReport(token, reportId, action, payload) {
   return fetchWithAuth(`/api/admin/reports/${encodeURIComponent(reportId)}/${action}`, token, {
     method: "POST",
@@ -437,6 +457,17 @@ function formatDateTime(value) {
   );
 
   return `${parts.hour}:${parts.minute} - ${parts.day}/${parts.month}/${parts.year}`;
+}
+
+function formatTechnicalValue(value) {
+  if (value === null || value === undefined || String(value).trim() === "") return "Không ghi nhận";
+  return String(value);
+}
+
+function formatTechnicalTime(value) {
+  if (!value) return "Không ghi nhận";
+  const formatted = formatDateTime(value);
+  return formatted === "Chưa có" ? "Không ghi nhận" : formatted;
 }
 
 function canReceiveReport(role, status) {
@@ -2686,11 +2717,121 @@ function ReportActionPanel({ auth, report, onUpdated }) {
   );
 }
 
+function ReportTechnicalMetadataPanel({ auth, reportId, technical, isLoading, error, onReload }) {
+  const metadata = technical?.technical_metadata || {};
+  const capturedAt = technical?.client_submitted_at || metadata.observed_at;
+  const activeBlocks = technical?.active_source_blocks || [];
+  const fingerprintBlocked = activeBlocks.find((item) => item.source_type === "FINGERPRINT" && item.is_active);
+  const [actionError, setActionError] = useState("");
+  const [actionMessage, setActionMessage] = useState("");
+  const [submittingAction, setSubmittingAction] = useState("");
+
+  async function runSourceAction(action) {
+    setActionError("");
+    setActionMessage("");
+    setSubmittingAction(action);
+    try {
+      if (action === "block") {
+        await blockAdminReportSource(auth.accessToken, reportId, "FINGERPRINT", "Chan nguon gui co dau hieu spam.");
+        setActionMessage("Đã chặn nguồn gửi theo fingerprint.");
+      } else if (fingerprintBlocked) {
+        await unblockAdminReportSource(auth.accessToken, fingerprintBlocked.id);
+        setActionMessage("Đã bỏ chặn nguồn gửi.");
+      }
+      await onReload();
+    } catch (actionLoadError) {
+      setActionError(actionLoadError.message || "Không thực hiện được thao tác nguồn gửi.");
+    } finally {
+      setSubmittingAction("");
+    }
+  }
+
+  return (
+    <section className="admin-card technical-card">
+      <details>
+        <summary>
+          <span className="eyebrow">Nội bộ</span>
+          <strong>THÔNG TIN KỸ THUẬT</strong>
+        </summary>
+
+        {isLoading && <p className="admin-muted">Đang tải thông tin kỹ thuật...</p>}
+        {error && <div className="form-error">{error}</div>}
+        {!isLoading && !error && (
+          <dl className="technical-metadata-list">
+            <div>
+              <dt>IP client</dt>
+              <dd>{formatTechnicalValue(metadata.client_ip)}</dd>
+            </div>
+            <div>
+              <dt>Source port</dt>
+              <dd>{formatTechnicalValue(metadata.observed_source_port)}</dd>
+            </div>
+            <div>
+              <dt>User-Agent</dt>
+              <dd>{formatTechnicalValue(metadata.user_agent)}</dd>
+            </div>
+            <div>
+              <dt>Thời gian ghi nhận metadata</dt>
+              <dd>{formatTechnicalTime(capturedAt)}</dd>
+            </div>
+          </dl>
+        )}
+        {!isLoading && !error && (
+          <div className="source-block-panel">
+            <div>
+              <span>Trạng thái nguồn gửi</span>
+              <strong>{fingerprintBlocked ? "Đang bị chặn" : "Chưa chặn"}</strong>
+            </div>
+            {activeBlocks.length > 0 && (
+              <ul>
+                {activeBlocks.map((item) => (
+                  <li key={item.id}>
+                    {item.source_type}: {item.reason || "Không ghi chú"}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {actionError && <div className="form-error">{actionError}</div>}
+            {actionMessage && <div className="form-status">{actionMessage}</div>}
+            <div className="report-action-buttons">
+              {!fingerprintBlocked && (
+                <button
+                  className="secondary-action danger-action"
+                  type="button"
+                  disabled={Boolean(submittingAction) || !technical?.request_fingerprint_hash}
+                  onClick={() => runSourceAction("block")}
+                >
+                  {submittingAction === "block" ? "Đang chặn..." : "CHẶN NGUỒN NÀY"}
+                </button>
+              )}
+              {fingerprintBlocked && (
+                <button
+                  className="secondary-action"
+                  type="button"
+                  disabled={Boolean(submittingAction)}
+                  onClick={() => runSourceAction("unblock")}
+                >
+                  {submittingAction === "unblock" ? "Đang bỏ chặn..." : "BỎ CHẶN NGUỒN NÀY"}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </details>
+    </section>
+  );
+}
+
 function AdminReportDetailPage({ auth }) {
   const { id } = useParams();
   const [report, setReport] = useState(null);
+  const [technical, setTechnical] = useState(null);
+  const [technicalError, setTechnicalError] = useState("");
+  const [isTechnicalLoading, setIsTechnicalLoading] = useState(false);
+  const [technicalReloadKey, setTechnicalReloadKey] = useState(0);
   const [error, setError] = useState("");
   const [isLoading, setIsLoading] = useState(true);
+  const canViewTechnicalMetadata = auth.user?.role === "ADMIN";
 
   useEffect(() => {
     let isMounted = true;
@@ -2714,6 +2855,39 @@ function AdminReportDetailPage({ auth }) {
       isMounted = false;
     };
   }, [auth.accessToken, id]);
+
+  async function loadTechnicalMetadata({ isMounted = () => true } = {}) {
+      if (!canViewTechnicalMetadata) {
+        setTechnical(null);
+        setTechnicalError("");
+        setIsTechnicalLoading(false);
+        return;
+      }
+
+      setIsTechnicalLoading(true);
+      setTechnicalError("");
+      try {
+        const body = await fetchAdminReportTechnical(auth.accessToken, id);
+        if (!isMounted()) return;
+        setTechnical(body);
+      } catch (loadError) {
+        if (isMounted()) {
+          setTechnical(null);
+          setTechnicalError(loadError.message || "Không tải được thông tin kỹ thuật.");
+        }
+      } finally {
+        if (isMounted()) setIsTechnicalLoading(false);
+      }
+    }
+
+  useEffect(() => {
+    let isMounted = true;
+
+    loadTechnicalMetadata({ isMounted: () => isMounted });
+    return () => {
+      isMounted = false;
+    };
+  }, [auth.accessToken, canViewTechnicalMetadata, id, technicalReloadKey]);
 
   return (
     <>
@@ -2812,6 +2986,19 @@ function AdminReportDetailPage({ auth }) {
               </ol>
             )}
           </section>
+
+          {canViewTechnicalMetadata && (
+            <ReportTechnicalMetadataPanel
+              auth={auth}
+              reportId={id}
+              technical={technical}
+              isLoading={isTechnicalLoading}
+              error={technicalError}
+              onReload={() => {
+                setTechnicalReloadKey((current) => current + 1);
+              }}
+            />
+          )}
         </>
       )}
     </>

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -777,6 +778,47 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(body["attachments"][0]["original_filename"], "test-image.png")
         self.assertEqual(body["status_history"], [])
 
+    def test_admin_only_report_technical_metadata_endpoint(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        with self.SessionTesting() as db:
+            report = db.get(Report, report_id)
+            report.reporter_ip_hash = "ip-hash"
+            report.reporter_user_agent_hash = "ua-hash"
+            report.request_fingerprint_hash = "fingerprint-hash"
+            report.client_submitted_at = datetime(2026, 10, 7, 9, 30, 0)
+            report.technical_metadata = json.dumps(
+                {
+                    "client_ip_source": "direct",
+                    "client_ip": "192.0.2.1",
+                    "user_agent": "Admin visible UA",
+                    "observed_source_port": 45678,
+                    "source_port_note": "Transport metadata only; not a device or person identifier.",
+                }
+            )
+            db.commit()
+
+        admin_response = self.client.get(
+            f"/api/admin/reports/{report_id}/technical",
+            headers=self.auth_headers(),
+        )
+        receiver_response = self.client.get(
+            f"/api/admin/reports/{report_id}/technical",
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+        no_auth_response = self.client.get(f"/api/admin/reports/{report_id}/technical")
+
+        self.assertEqual(admin_response.status_code, 200)
+        body = admin_response.json()
+        self.assertEqual(body["tracking_code"], "YT360-AAAAAA")
+        self.assertEqual(body["reporter_ip_hash"], "ip-hash")
+        self.assertEqual(body["reporter_user_agent_hash"], "ua-hash")
+        self.assertEqual(body["request_fingerprint_hash"], "fingerprint-hash")
+        self.assertEqual(body["technical_metadata"]["client_ip"], "192.0.2.1")
+        self.assertEqual(body["technical_metadata"]["user_agent"], "Admin visible UA")
+        self.assertEqual(body["technical_metadata"]["observed_source_port"], 45678)
+        self.assertEqual(receiver_response.status_code, 403)
+        self.assertEqual(no_auth_response.status_code, 401)
+
     def test_valid_receive_transition_updates_report_history_and_audit_log(self):
         report_id = self.report_id("YT360-AAAAAA")
 
@@ -1102,6 +1144,16 @@ class AuthApiTests(unittest.TestCase):
             report.created_at = datetime(2026, 9, 30, 16, 59, 59)
             report.updated_at = datetime(2026, 9, 30, 16, 59, 59)
             report.internal_note = "SECRET INTERNAL NOTE MUST NOT EXPORT"
+            report.reporter_ip_hash = "IP HASH MUST NOT EXPORT"
+            report.reporter_user_agent_hash = "UA HASH MUST NOT EXPORT"
+            report.request_fingerprint_hash = "FINGERPRINT MUST NOT EXPORT"
+            report.technical_metadata = json.dumps(
+                {
+                    "client_ip": "203.0.113.77",
+                    "observed_source_port": 54321,
+                    "user_agent": "SECRET USER AGENT MUST NOT EXPORT",
+                }
+            )
             category.name = "@TEST Category"
             area.name = "-TEST Area"
             db.commit()
@@ -1138,6 +1190,12 @@ class AuthApiTests(unittest.TestCase):
         self.assertNotIn("token", sheet_xml.lower())
         self.assertNotIn("audit", sheet_xml.lower())
         self.assertNotIn("SECRET INTERNAL NOTE", sheet_xml)
+        self.assertNotIn("IP HASH MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("UA HASH MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("FINGERPRINT MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("203.0.113.77", sheet_xml)
+        self.assertNotIn("54321", sheet_xml)
+        self.assertNotIn("SECRET USER AGENT", sheet_xml)
         self.assertNotIn("<f>", sheet_xml)
         self.assertIn('t="inlineStr"', sheet_xml)
 

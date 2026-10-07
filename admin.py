@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -120,6 +121,16 @@ class AdminReportDetailOut(BaseModel):
     internal_note: str | None
     attachments: list[AdminAttachmentOut]
     status_history: list[AdminStatusHistoryOut]
+
+
+class AdminReportTechnicalOut(BaseModel):
+    id: int
+    tracking_code: str
+    reporter_ip_hash: str | None
+    reporter_user_agent_hash: str | None
+    request_fingerprint_hash: str | None
+    client_submitted_at: datetime | None
+    technical_metadata: dict[str, Any] | None
 
 
 class AdminReportTransitionIn(BaseModel):

@@ -8,6 +8,7 @@ const RAW_API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL ?? import.meta.env.VITE_API_URL ?? (isLocalFrontend ? "" : PRODUCTION_API_BASE_URL);
 const API_BASE_URL = RAW_API_BASE_URL.replace(/\/$/, "");
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_REPORT_IMAGES = 5;
 const ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/webp", "image/gif"];
 const TRACKING_CODE_PATTERN = /^YT360-[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{6}$/;
 const AUTH_STORAGE_KEY = "yt360_admin_auth";
@@ -389,6 +390,16 @@ async function unblockAdminReportSource(token, blockId) {
   });
 }
 
+async function linkAdminRelatedReport(token, reportId, relatedReportId, reason) {
+  return fetchWithAuth(`/api/admin/reports/${encodeURIComponent(reportId)}/related-reports`, token, {
+    method: "POST",
+    body: JSON.stringify({
+      related_report_id: Number(relatedReportId),
+      reason,
+    }),
+  });
+}
+
 async function transitionAdminReport(token, reportId, action, payload) {
   return fetchWithAuth(`/api/admin/reports/${encodeURIComponent(reportId)}/${action}`, token, {
     method: "POST",
@@ -414,6 +425,16 @@ async function fetchAdminAttachmentBlob(token, reportId, attachmentId) {
   }
 
   return response.blob();
+}
+
+async function uploadAdminProcessingImages(token, reportId, attachmentType, files) {
+  const payload = new FormData();
+  payload.append("attachment_type", attachmentType);
+  files.forEach((file) => payload.append("images", file));
+  return fetchWithAuth(`/api/admin/reports/${encodeURIComponent(reportId)}/attachments`, token, {
+    method: "POST",
+    body: payload,
+  });
 }
 
 function loadStoredAuth() {
@@ -582,21 +603,18 @@ function CitizenReportPage() {
     categoryId: "",
     areaId: "",
     description: "",
-    image: null,
+    images: [],
     confirmed: false,
   });
   const [errors, setErrors] = useState({});
 
-  const imagePreview = useMemo(() => {
-    if (!form.image) return "";
-    return URL.createObjectURL(form.image);
-  }, [form.image]);
+  const imagePreviews = useMemo(() => form.images.map((file) => URL.createObjectURL(file)), [form.images]);
 
   useEffect(() => {
     return () => {
-      if (imagePreview) URL.revokeObjectURL(imagePreview);
+      imagePreviews.forEach((url) => URL.revokeObjectURL(url));
     };
-  }, [imagePreview]);
+  }, [imagePreviews]);
 
   useEffect(() => {
     let isMounted = true;
@@ -631,29 +649,40 @@ function CitizenReportPage() {
   }
 
   function handleImageChange(event) {
-    const file = event.target.files?.[0] ?? null;
-    if (!file) {
-      updateField("image", null);
+    const files = Array.from(event.target.files ?? []);
+    if (files.length === 0) {
+      updateField("images", []);
       return;
     }
 
-    if (!ALLOWED_IMAGE_TYPES.includes(file.type)) {
-      setErrors((current) => ({ ...current, image: "Chỉ chấp nhận ảnh JPG, PNG, WEBP hoặc GIF." }));
+    if (files.length > MAX_REPORT_IMAGES) {
+      setErrors((current) => ({ ...current, images: `Chỉ được chọn tối đa ${MAX_REPORT_IMAGES} ảnh.` }));
       event.target.value = "";
       return;
     }
 
-    if (file.size > MAX_IMAGE_BYTES) {
-      setErrors((current) => ({ ...current, image: "Ảnh không được vượt quá 5 MB." }));
+    const invalidType = files.find((file) => !ALLOWED_IMAGE_TYPES.includes(file.type));
+    if (invalidType) {
+      setErrors((current) => ({ ...current, images: "Chỉ chấp nhận ảnh JPG, PNG, WEBP hoặc GIF." }));
       event.target.value = "";
       return;
     }
 
-    updateField("image", file);
+    const oversized = files.find((file) => file.size > MAX_IMAGE_BYTES);
+    if (oversized) {
+      setErrors((current) => ({ ...current, images: "Mỗi ảnh không được vượt quá 5 MB." }));
+      event.target.value = "";
+      return;
+    }
+
+    updateField("images", files);
   }
 
-  function removeImage() {
-    updateField("image", null);
+  function removeImage(indexToRemove) {
+    updateField(
+      "images",
+      form.images.filter((_, index) => index !== indexToRemove),
+    );
     if (imageInputRef.current) {
       imageInputRef.current.value = "";
     }
@@ -686,7 +715,7 @@ function CitizenReportPage() {
     payload.append("category_id", form.categoryId);
     payload.append("area_id", form.areaId);
     payload.append("description", form.description.trim());
-    if (form.image) payload.append("image", form.image);
+    form.images.forEach((file) => payload.append("images", file));
 
     try {
       const response = await fetch(apiUrl("/api/public/reports"), {
@@ -825,18 +854,25 @@ function CitizenReportPage() {
               id="report-image"
               ref={imageInputRef}
               type="file"
+              multiple
               accept="image/jpeg,image/png,image/webp,image/gif"
               onChange={handleImageChange}
             />
           </label>
-          <p className="helper-text">Chấp nhận JPG, PNG, WEBP hoặc GIF. Tối đa 5 MB.</p>
-          {errors.image && <small className="field-error">{errors.image}</small>}
-          {imagePreview && (
-            <div className="image-preview">
-              <img src={imagePreview} alt="Ảnh xem trước" />
-              <button type="button" onClick={removeImage}>
-                Bỏ ảnh
-              </button>
+          <p className="helper-text">
+            Chấp nhận JPG, PNG, WEBP hoặc GIF. Tối đa {MAX_REPORT_IMAGES} ảnh, mỗi ảnh 5 MB.
+          </p>
+          {errors.images && <small className="field-error">{errors.images}</small>}
+          {imagePreviews.length > 0 && (
+            <div className="image-preview-grid">
+              {imagePreviews.map((previewUrl, index) => (
+                <div className="image-preview" key={`${form.images[index]?.name}-${index}`}>
+                  <img src={previewUrl} alt={`Ảnh xem trước ${index + 1}`} />
+                  <button type="button" onClick={() => removeImage(index)}>
+                    Bỏ ảnh
+                  </button>
+                </div>
+              ))}
             </div>
           )}
         </div>
@@ -2572,8 +2608,163 @@ function AdminAttachmentImage({ auth, reportId, attachment }) {
   return (
     <figure className="admin-attachment">
       <img src={imageUrl} alt={attachment.original_filename} />
-      <figcaption>{attachment.original_filename}</figcaption>
+      <figcaption>
+        {attachment.original_filename}
+        {attachment.attachment_type && <span>{attachment.attachment_type}</span>}
+      </figcaption>
     </figure>
+  );
+}
+
+function DuplicateWarningPanel({ auth, report, onUpdated }) {
+  const [linkingId, setLinkingId] = useState("");
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const links = report.duplicate_links ?? [];
+  const suggested = links.filter((item) => item.status === "SUGGESTED");
+
+  async function confirmLink(link) {
+    setLinkingId(link.id);
+    setMessage("");
+    setError("");
+    try {
+      await linkAdminRelatedReport(
+        auth.accessToken,
+        report.id,
+        link.related_report_id,
+        link.reason || "Lien ket tu canh bao trung lap V2.4.",
+      );
+      const updated = await fetchAdminReportDetail(auth.accessToken, report.id);
+      onUpdated(updated);
+      setMessage("Đã liên kết phản ánh liên quan.");
+    } catch (linkError) {
+      setError(linkError.message || "Không liên kết được phản ánh.");
+    } finally {
+      setLinkingId("");
+    }
+  }
+
+  if (links.length === 0) return null;
+
+  return (
+    <section className="admin-card duplicate-warning-card">
+      <div className="admin-card-title">
+        <p className="eyebrow">Cảnh báo</p>
+        <h2>PHẢN ÁNH CÓ KHẢ NĂNG TRÙNG</h2>
+      </div>
+      {suggested.length > 0 && (
+        <p className="admin-muted">Hệ thống chỉ cảnh báo, không tự động gộp hoặc xóa phản ánh.</p>
+      )}
+      {message && <div className="form-status">{message}</div>}
+      {error && <div className="form-error">{error}</div>}
+      <ul className="duplicate-link-list">
+        {links.map((link) => (
+          <li key={link.id}>
+            <div>
+              <strong>{link.related_tracking_code}</strong>
+              <span className={`status-pill ${link.related_status.toLowerCase()}`}>
+                {statusLabels[link.related_status] || link.related_status}
+              </span>
+            </div>
+            <p>{link.reason || "Có dữ liệu tương đồng với phản ánh này."}</p>
+            {Number.isFinite(Number(link.score)) && <small>Điểm cảnh báo: {Number(link.score).toFixed(2)}</small>}
+            {link.status === "SUGGESTED" ? (
+              <button
+                className="secondary-action"
+                type="button"
+                disabled={linkingId === link.id}
+                onClick={() => confirmLink(link)}
+              >
+                {linkingId === link.id ? "Đang liên kết..." : "Liên kết phản ánh"}
+              </button>
+            ) : (
+              <small>Đã liên kết</small>
+            )}
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function ProcessingImageUploadPanel({ auth, report, onUpdated }) {
+  const role = auth.user?.role;
+  const canUpload = ["ADMIN", "HANDLER"].includes(role);
+  const [attachmentType, setAttachmentType] = useState("AFTER");
+  const [files, setFiles] = useState([]);
+  const [error, setError] = useState("");
+  const [message, setMessage] = useState("");
+  const [isUploading, setIsUploading] = useState(false);
+
+  if (!canUpload) return null;
+
+  function handleFilesChange(event) {
+    const selectedFiles = Array.from(event.target.files ?? []);
+    setError("");
+    setMessage("");
+    if (selectedFiles.length > MAX_REPORT_IMAGES) {
+      setFiles([]);
+      event.target.value = "";
+      setError(`Chỉ được chọn tối đa ${MAX_REPORT_IMAGES} ảnh.`);
+      return;
+    }
+    setFiles(selectedFiles);
+  }
+
+  async function handleUpload(event) {
+    event.preventDefault();
+    if (files.length === 0) {
+      setError("Vui lòng chọn ảnh xử lý.");
+      return;
+    }
+
+    setIsUploading(true);
+    setError("");
+    setMessage("");
+    try {
+      const updated = await uploadAdminProcessingImages(auth.accessToken, report.id, attachmentType, files);
+      onUpdated(updated);
+      setFiles([]);
+      setMessage("Đã thêm ảnh xử lý.");
+    } catch (uploadError) {
+      setError(uploadError.message || "Không tải được ảnh xử lý.");
+    } finally {
+      setIsUploading(false);
+    }
+  }
+
+  return (
+    <section className="admin-card processing-image-card">
+      <div className="admin-card-title">
+        <p className="eyebrow">Ảnh xử lý</p>
+        <h2>THÊM ẢNH TRƯỚC / SAU XỬ LÝ</h2>
+      </div>
+      <form className="processing-image-form" onSubmit={handleUpload}>
+        <label>
+          <span>Loại ảnh</span>
+          <select value={attachmentType} onChange={(event) => setAttachmentType(event.target.value)}>
+            <option value="BEFORE">Trước xử lý</option>
+            <option value="AFTER">Sau xử lý</option>
+            <option value="OTHER">Khác</option>
+          </select>
+        </label>
+        <label>
+          <span>Chọn ảnh</span>
+          <input
+            type="file"
+            multiple
+            accept="image/jpeg,image/png,image/webp,image/gif"
+            onChange={handleFilesChange}
+          />
+        </label>
+        {files.length > 0 && <p className="admin-muted">Đã chọn {files.length} ảnh.</p>}
+        {message && <div className="form-status">{message}</div>}
+        {error && <div className="form-error">{error}</div>}
+        <button className="secondary-action" type="submit" disabled={isUploading}>
+          {isUploading ? "Đang tải..." : "Thêm ảnh xử lý"}
+        </button>
+      </form>
+    </section>
   );
 }
 
@@ -2957,6 +3148,10 @@ function AdminReportDetailPage({ auth }) {
               ))}
             </div>
           </section>
+
+          <DuplicateWarningPanel auth={auth} report={report} onUpdated={setReport} />
+
+          <ProcessingImageUploadPanel auth={auth} report={report} onUpdated={setReport} />
 
           <ReportActionPanel auth={auth} report={report} onUpdated={setReport} />
 

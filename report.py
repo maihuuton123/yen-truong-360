@@ -3,6 +3,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
     Float,
@@ -49,6 +50,19 @@ class NotificationStatus(str, enum.Enum):
     CANCELLED = "CANCELLED"
 
 
+class AttachmentType(str, enum.Enum):
+    INITIAL = "INITIAL"
+    BEFORE = "BEFORE"
+    AFTER = "AFTER"
+    OTHER = "OTHER"
+
+
+class DuplicateLinkStatus(str, enum.Enum):
+    SUGGESTED = "SUGGESTED"
+    LINKED = "LINKED"
+    DISMISSED = "DISMISSED"
+
+
 status_enum = Enum(
     ReportStatus,
     name="report_status",
@@ -76,6 +90,22 @@ additional_info_request_status_enum = Enum(
 notification_status_enum = Enum(
     NotificationStatus,
     name="notification_status",
+    native_enum=False,
+    length=32,
+    validate_strings=True,
+)
+
+attachment_type_enum = Enum(
+    AttachmentType,
+    name="attachment_type",
+    native_enum=False,
+    length=32,
+    validate_strings=True,
+)
+
+duplicate_link_status_enum = Enum(
+    DuplicateLinkStatus,
+    name="duplicate_link_status",
     native_enum=False,
     length=32,
     validate_strings=True,
@@ -111,6 +141,10 @@ class User(Base):
     internal_notes: Mapped[list["ReportInternalNote"]] = relationship(back_populates="author_user")
     additional_info_requests: Mapped[list["AdditionalInfoRequest"]] = relationship(back_populates="requested_by_user")
     notifications: Mapped[list["Notification"]] = relationship(back_populates="recipient_user")
+    duplicate_links_created: Mapped[list["ReportDuplicateLink"]] = relationship(
+        back_populates="created_by_user",
+        foreign_keys="ReportDuplicateLink.created_by",
+    )
 
 
 class Category(Base):
@@ -213,6 +247,16 @@ class Report(Base):
     internal_notes: Mapped[list["ReportInternalNote"]] = relationship(back_populates="report", cascade="all, delete-orphan")
     additional_info_requests: Mapped[list["AdditionalInfoRequest"]] = relationship(back_populates="report", cascade="all, delete-orphan")
     notifications: Mapped[list["Notification"]] = relationship(back_populates="report", cascade="all, delete-orphan")
+    duplicate_links: Mapped[list["ReportDuplicateLink"]] = relationship(
+        back_populates="report",
+        cascade="all, delete-orphan",
+        foreign_keys="ReportDuplicateLink.report_id",
+    )
+    related_duplicate_links: Mapped[list["ReportDuplicateLink"]] = relationship(
+        back_populates="related_report",
+        cascade="all, delete-orphan",
+        foreign_keys="ReportDuplicateLink.related_report_id",
+    )
 
     __table_args__ = (
         Index("ix_reports_status_created_at", "status", "created_at"),
@@ -232,9 +276,53 @@ class Attachment(Base):
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(120), nullable=False)
     file_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    attachment_type: Mapped[AttachmentType] = mapped_column(
+        attachment_type_enum,
+        nullable=False,
+        default=AttachmentType.INITIAL,
+        server_default=AttachmentType.INITIAL.value,
+        index=True,
+    )
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false(), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     report: Mapped[Report] = relationship(back_populates="attachments")
+
+    __table_args__ = (
+        CheckConstraint("attachment_type IN ('INITIAL', 'BEFORE', 'AFTER', 'OTHER')", name="ck_attachments_attachment_type"),
+        Index("ix_attachments_report_type", "report_id", "attachment_type"),
+    )
+
+
+class ReportDuplicateLink(Base):
+    __tablename__ = "report_duplicate_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
+    related_report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[DuplicateLinkStatus] = mapped_column(
+        duplicate_link_status_enum,
+        nullable=False,
+        default=DuplicateLinkStatus.SUGGESTED,
+        server_default=DuplicateLinkStatus.SUGGESTED.value,
+        index=True,
+    )
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    report: Mapped[Report] = relationship(back_populates="duplicate_links", foreign_keys=[report_id])
+    related_report: Mapped[Report] = relationship(back_populates="related_duplicate_links", foreign_keys=[related_report_id])
+    created_by_user: Mapped[User | None] = relationship(back_populates="duplicate_links_created", foreign_keys=[created_by])
+
+    __table_args__ = (
+        CheckConstraint("status IN ('SUGGESTED', 'LINKED', 'DISMISSED')", name="ck_report_duplicate_links_status"),
+        CheckConstraint("report_id <> related_report_id", name="ck_report_duplicate_links_not_self"),
+        Index("ix_report_duplicate_links_pair", "report_id", "related_report_id", unique=True),
+        Index("ix_report_duplicate_links_status_score", "status", "score"),
+    )
 
 
 class StatusHistory(Base):

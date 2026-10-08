@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import re
@@ -13,7 +14,16 @@ from app.core.config import settings
 from app.core.client_metadata import collect_report_technical_metadata
 from app.core.rate_limit import limit_public_lookup_requests
 from app.db.dependencies import get_db
-from app.models import Area, Attachment, Category, Report, ReportStatus
+from app.models import (
+    Area,
+    Attachment,
+    AttachmentType,
+    Category,
+    DuplicateLinkStatus,
+    Report,
+    ReportDuplicateLink,
+    ReportStatus,
+)
 from app.schemas.public import (
     PublicAreaOut,
     PublicCategoryOut,
@@ -85,6 +95,7 @@ async def create_public_report(
     area_id: int = Form(...),
     description: str = Form(...),
     image: UploadFile | None = File(default=None),
+    images: list[UploadFile] | None = File(default=None),
     db: Session = Depends(get_db),
 ) -> PublicReportCreatedOut:
     cleaned_description = validate_description(description)
@@ -101,7 +112,8 @@ async def create_public_report(
         "captcha_provider_enabled": spam_assessment.captcha_provider_enabled,
         "captcha_note": "CAPTCHA hook only; no provider is enforced unless configured.",
     }
-    attachment_data = await prepare_image_upload(image) if image is not None else None
+    uploaded_images = normalized_uploads(image=image, images=images)
+    attachment_data = await prepare_image_uploads(uploaded_images)
 
     report = Report(
         tracking_code=generate_unique_tracking_code(db),
@@ -122,10 +134,10 @@ async def create_public_report(
     db.add(report)
     db.flush()
 
-    saved_file_path: Path | None = None
-    if attachment_data is not None:
-        stored_filename, original_filename, mime_type, content = attachment_data
-        saved_file_path = save_upload_file(stored_filename, content)
+    saved_file_paths: list[Path] = []
+    for attachment in attachment_data:
+        stored_filename, original_filename, mime_type, content = attachment
+        saved_file_paths.append(save_upload_file(stored_filename, content))
         db.add(
             Attachment(
                 report_id=report.id,
@@ -133,21 +145,24 @@ async def create_public_report(
                 original_filename=original_filename,
                 mime_type=mime_type,
                 file_size=len(content),
+                attachment_type=AttachmentType.INITIAL,
+                is_public=False,
             )
         )
+    add_duplicate_warnings(db, report)
 
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        cleanup_saved_file(saved_file_path)
+        cleanup_saved_files(saved_file_paths)
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Không thể tạo mã tra cứu duy nhất. Vui lòng thử lại.",
         ) from exc
     except Exception:
         db.rollback()
-        cleanup_saved_file(saved_file_path)
+        cleanup_saved_files(saved_file_paths)
         raise
 
     db.refresh(report)
@@ -280,6 +295,29 @@ def generate_unique_tracking_code(db: Session) -> str:
     )
 
 
+def normalized_uploads(
+    *,
+    image: UploadFile | None,
+    images: list[UploadFile] | None,
+) -> list[UploadFile]:
+    uploads: list[UploadFile] = []
+    if image is not None:
+        uploads.append(image)
+    if images:
+        uploads.extend(item for item in images if item is not None)
+
+    if len(uploads) > settings.max_report_images:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Chi duoc tai len toi da {settings.max_report_images} anh cho moi phan anh.",
+        )
+    return uploads
+
+
+async def prepare_image_uploads(images: list[UploadFile]) -> list[tuple[str, str, str, bytes]]:
+    return [await prepare_image_upload(image) for image in images]
+
+
 async def prepare_image_upload(image: UploadFile) -> tuple[str, str, str, bytes]:
     mime_type = image.content_type or ""
     if mime_type not in ALLOWED_IMAGE_TYPES:
@@ -288,7 +326,13 @@ async def prepare_image_upload(image: UploadFile) -> tuple[str, str, str, bytes]
             detail="Chỉ chấp nhận file ảnh JPG, PNG, WEBP hoặc GIF.",
         )
 
-    original_filename = Path(image.filename or "upload").name or "upload"
+    raw_filename = image.filename or "upload"
+    if raw_filename in {".", ".."} or any(separator in raw_filename for separator in ("/", "\\")):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Ten file anh khong hop le.",
+        )
+    original_filename = Path(raw_filename).name or "upload"
     original_suffix = Path(original_filename).suffix.lower()
     if original_suffix not in ALLOWED_IMAGE_EXTENSIONS[mime_type]:
         raise HTTPException(
@@ -328,16 +372,87 @@ def has_valid_image_signature(content: bytes, mime_type: str) -> bool:
 def save_upload_file(stored_filename: str, content: bytes) -> Path:
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
-    destination = upload_dir / stored_filename
+    destination = (upload_dir / stored_filename).resolve()
+    upload_root = upload_dir.resolve()
+    if upload_root != destination and upload_root not in destination.parents:
+        raise HTTPException(status_code=422, detail="Ten file luu tru khong hop le.")
     destination.write_bytes(content)
     return destination
 
 
-def cleanup_saved_file(path: Path | None) -> None:
-    if path is None:
+def cleanup_saved_files(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def add_duplicate_warnings(db: Session, report: Report) -> None:
+    suggestions = detect_possible_duplicates(db, report)
+    if not suggestions:
         return
 
-    try:
-        path.unlink(missing_ok=True)
-    except OSError:
-        pass
+    report.is_duplicate = True
+    for candidate, score, reason in suggestions:
+        db.add(
+            ReportDuplicateLink(
+                report_id=report.id,
+                related_report_id=candidate.id,
+                status=DuplicateLinkStatus.SUGGESTED,
+                score=score,
+                reason=reason,
+            )
+        )
+
+
+def detect_possible_duplicates(db: Session, report: Report) -> list[tuple[Report, float, str]]:
+    window_started_at = datetime.now(timezone.utc) - timedelta(hours=settings.duplicate_detection_window_hours)
+    candidates = db.scalars(
+        select(Report)
+        .where(
+            Report.id != report.id,
+            Report.category_id == report.category_id,
+            Report.area_id == report.area_id,
+            Report.created_at >= window_started_at,
+        )
+        .order_by(Report.created_at.desc(), Report.id.desc())
+        .limit(50)
+    ).all()
+    matches: list[tuple[Report, float, str]] = []
+    for candidate in candidates:
+        score = duplicate_score(report, candidate)
+        if score >= settings.duplicate_similarity_threshold:
+            matches.append((candidate, score, duplicate_reason(score)))
+
+    matches.sort(key=lambda item: item[1], reverse=True)
+    return matches[: settings.duplicate_max_suggestions]
+
+
+def duplicate_score(report: Report, candidate: Report) -> float:
+    score = 0.35
+    score += 0.45 * jaccard_similarity(report.description, candidate.description)
+    if (
+        report.location_latitude is not None
+        and report.location_longitude is not None
+        and report.location_latitude == candidate.location_latitude
+        and report.location_longitude == candidate.location_longitude
+    ):
+        score += 0.2
+    return min(score, 1.0)
+
+
+def duplicate_reason(score: float) -> str:
+    return f"Cung nhom, cung khu vuc, gan thoi gian va noi dung tuong dong ({score:.2f})."
+
+
+def jaccard_similarity(left: str, right: str) -> float:
+    left_tokens = tokenize_for_similarity(left)
+    right_tokens = tokenize_for_similarity(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def tokenize_for_similarity(value: str) -> set[str]:
+    return {token for token in re.findall(r"\w+", value.lower()) if len(token) >= 3}

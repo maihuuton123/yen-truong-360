@@ -11,6 +11,8 @@ EXPECTED_TABLES = {
     "reports",
     "attachments",
     "status_history",
+    "report_source_blocks",
+    "report_duplicate_links",
     "report_assignment_history",
     "report_internal_notes",
     "additional_info_requests",

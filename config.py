@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     upload_dir: str = Field(default="./uploads/reports", alias="UPLOAD_DIR")
     public_site_url: str = Field(default="http://localhost:5173", alias="PUBLIC_SITE_URL")
     max_upload_bytes: int = Field(default=5 * 1024 * 1024, alias="MAX_UPLOAD_BYTES")
+    max_report_images: int = Field(default=5, alias="MAX_REPORT_IMAGES")
+    duplicate_detection_window_hours: int = Field(default=72, alias="DUPLICATE_DETECTION_WINDOW_HOURS")
+    duplicate_similarity_threshold: float = Field(default=0.45, alias="DUPLICATE_SIMILARITY_THRESHOLD")
+    duplicate_max_suggestions: int = Field(default=5, alias="DUPLICATE_MAX_SUGGESTIONS")
     public_report_rate_limit: int = Field(default=60, alias="PUBLIC_REPORT_RATE_LIMIT")
     public_report_rate_limit_window_seconds: int = Field(
         default=60,

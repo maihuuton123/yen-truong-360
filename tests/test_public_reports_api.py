@@ -1,17 +1,36 @@
 ﻿import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api.v1 import public as public_api
-from app.core.rate_limit import public_lookup_limiter, public_report_limiter
+from app.core.client_metadata import USER_AGENT_MAX_LENGTH, collect_report_technical_metadata, hash_technical_value
+from app.core.rate_limit import public_lookup_limiter, public_report_limiter, public_report_rapid_limiter
 from app.db.base import Base
 from app.db.dependencies import get_db
 from app.main import create_app
-from app.models import Area, Attachment, AuditLog, Category, Report, ReportStatus, StatusHistory, User
+from app.models import (
+    Area,
+    Attachment,
+    AttachmentType,
+    AuditLog,
+    Category,
+    DuplicateLinkStatus,
+    Report,
+    ReportDuplicateLink,
+    ReportSourceBlock,
+    ReportStatus,
+    StatusHistory,
+    User,
+)
 
 
 PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
@@ -29,17 +48,34 @@ class PublicReportsApiTests(unittest.TestCase):
 
         self.previous_upload_dir = public_api.settings.upload_dir
         self.previous_max_upload_bytes = public_api.settings.max_upload_bytes
+        self.previous_max_report_images = public_api.settings.max_report_images
+        self.previous_duplicate_window = public_api.settings.duplicate_detection_window_hours
+        self.previous_duplicate_threshold = public_api.settings.duplicate_similarity_threshold
+        self.previous_duplicate_max_suggestions = public_api.settings.duplicate_max_suggestions
         self.previous_rate_limit = public_api.settings.public_report_rate_limit
         self.previous_rate_limit_window = public_api.settings.public_report_rate_limit_window_seconds
+        self.previous_rapid_limit = public_api.settings.public_report_rapid_limit
+        self.previous_rapid_window = public_api.settings.public_report_rapid_window_seconds
+        self.previous_spam_flag_threshold = public_api.settings.public_report_spam_flag_threshold
         self.previous_lookup_rate_limit = public_api.settings.public_lookup_rate_limit
         self.previous_lookup_rate_limit_window = public_api.settings.public_lookup_rate_limit_window_seconds
+        self.previous_trusted_proxy_ips = list(public_api.settings.trusted_proxy_ips)
         public_api.settings.upload_dir = str(self.upload_dir)
         public_api.settings.max_upload_bytes = 1024 * 1024
+        public_api.settings.max_report_images = 5
+        public_api.settings.duplicate_detection_window_hours = 72
+        public_api.settings.duplicate_similarity_threshold = 0.45
+        public_api.settings.duplicate_max_suggestions = 5
         public_api.settings.public_report_rate_limit = 100
         public_api.settings.public_report_rate_limit_window_seconds = 60
+        public_api.settings.public_report_rapid_limit = 100
+        public_api.settings.public_report_rapid_window_seconds = 10
+        public_api.settings.public_report_spam_flag_threshold = 10
         public_api.settings.public_lookup_rate_limit = 100
         public_api.settings.public_lookup_rate_limit_window_seconds = 60
+        public_api.settings.trusted_proxy_ips = []
         public_report_limiter.reset()
+        public_report_rapid_limiter.reset()
         public_lookup_limiter.reset()
 
         app = create_app()
@@ -51,11 +87,20 @@ class PublicReportsApiTests(unittest.TestCase):
         self.engine.dispose()
         public_api.settings.upload_dir = self.previous_upload_dir
         public_api.settings.max_upload_bytes = self.previous_max_upload_bytes
+        public_api.settings.max_report_images = self.previous_max_report_images
+        public_api.settings.duplicate_detection_window_hours = self.previous_duplicate_window
+        public_api.settings.duplicate_similarity_threshold = self.previous_duplicate_threshold
+        public_api.settings.duplicate_max_suggestions = self.previous_duplicate_max_suggestions
         public_api.settings.public_report_rate_limit = self.previous_rate_limit
         public_api.settings.public_report_rate_limit_window_seconds = self.previous_rate_limit_window
+        public_api.settings.public_report_rapid_limit = self.previous_rapid_limit
+        public_api.settings.public_report_rapid_window_seconds = self.previous_rapid_window
+        public_api.settings.public_report_spam_flag_threshold = self.previous_spam_flag_threshold
         public_api.settings.public_lookup_rate_limit = self.previous_lookup_rate_limit
         public_api.settings.public_lookup_rate_limit_window_seconds = self.previous_lookup_rate_limit_window
+        public_api.settings.trusted_proxy_ips = self.previous_trusted_proxy_ips
         public_report_limiter.reset()
+        public_report_rapid_limiter.reset()
         public_lookup_limiter.reset()
         self.temp_dir.cleanup()
 
@@ -86,6 +131,24 @@ class PublicReportsApiTests(unittest.TestCase):
         with self.SessionTesting() as db:
             return db.scalar(select(func.count()).select_from(Attachment))
 
+    def count_duplicate_links(self):
+        with self.SessionTesting() as db:
+            return db.scalar(select(func.count()).select_from(ReportDuplicateLink))
+
+    def create_active_category(self, name="Nhóm khác"):
+        with self.SessionTesting() as db:
+            category = Category(name=name, icon="other", display_order=50, is_active=True)
+            db.add(category)
+            db.commit()
+            return category.id
+
+    def create_active_area(self, name="Khu vực khác"):
+        with self.SessionTesting() as db:
+            area = Area(name=name, display_order=50, is_active=True)
+            db.add(area)
+            db.commit()
+            return area.id
+
     def test_get_categories_returns_active_seeded_data(self):
         response = self.client.get("/api/public/categories")
 
@@ -111,7 +174,12 @@ class PublicReportsApiTests(unittest.TestCase):
             "description": "Cành cây chắn một phần đường đi.",
         }
         data.update(overrides.pop("data", {}))
-        return self.client.post("/api/public/reports", data=data, files=overrides.pop("files", None))
+        return self.client.post(
+            "/api/public/reports",
+            data=data,
+            files=overrides.pop("files", None),
+            headers=overrides.pop("headers", None),
+        )
 
     def test_create_report_valid(self):
         response = self.post_report(files={"image": ("photo.png", PNG_BYTES, "image/png")})
@@ -131,9 +199,209 @@ class PublicReportsApiTests(unittest.TestCase):
             attachment = db.scalar(select(Attachment).where(Attachment.report_id == report.id))
             self.assertIsNotNone(attachment)
             self.assertEqual(attachment.mime_type, "image/png")
+            self.assertEqual(attachment.attachment_type, AttachmentType.INITIAL)
+            self.assertFalse(attachment.is_public)
             self.assertTrue((self.upload_dir / attachment.stored_filename).exists())
             self.assertNotEqual(attachment.stored_filename, "photo.png")
             self.assertFalse(Path(attachment.stored_filename).is_absolute())
+
+    def test_create_report_without_image_is_allowed(self):
+        response = self.post_report()
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.count_attachments(), 0)
+
+    def test_create_report_accepts_multiple_images(self):
+        response = self.post_report(
+            files=[
+                ("images", ("first.png", PNG_BYTES, "image/png")),
+                ("images", ("second.png", PNG_BYTES, "image/png")),
+                ("images", ("third.png", PNG_BYTES, "image/png")),
+            ]
+        )
+
+        self.assertEqual(response.status_code, 201)
+        with self.SessionTesting() as db:
+            report = db.scalar(select(Report).where(Report.tracking_code == response.json()["tracking_code"]))
+            attachments = db.scalars(select(Attachment).where(Attachment.report_id == report.id)).all()
+            self.assertEqual(len(attachments), 3)
+            self.assertTrue(all(attachment.attachment_type == AttachmentType.INITIAL for attachment in attachments))
+            self.assertTrue(all(not attachment.is_public for attachment in attachments))
+
+    def test_public_report_cannot_fake_processing_image_type(self):
+        response = self.post_report(
+            data={"attachment_type": "AFTER"},
+            files={"image": ("after.png", PNG_BYTES, "image/png")},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        with self.SessionTesting() as db:
+            report = db.scalar(select(Report).where(Report.tracking_code == response.json()["tracking_code"]))
+            attachment = db.scalar(select(Attachment).where(Attachment.report_id == report.id))
+            self.assertEqual(attachment.attachment_type, AttachmentType.INITIAL)
+            self.assertFalse(attachment.is_public)
+
+    def test_create_report_accepts_exactly_max_images(self):
+        public_api.settings.max_report_images = 5
+        files = [("images", (f"photo-{index}.png", PNG_BYTES, "image/png")) for index in range(5)]
+
+        response = self.post_report(files=files)
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.count_attachments(), 5)
+
+    def test_create_report_rejects_more_than_max_images(self):
+        public_api.settings.max_report_images = 2
+        before_reports = self.count_reports()
+        files = [("images", (f"photo-{index}.png", PNG_BYTES, "image/png")) for index in range(3)]
+
+        response = self.post_report(files=files)
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(self.count_reports(), before_reports)
+        self.assertEqual(self.count_attachments(), 0)
+
+    def test_create_report_records_technical_metadata_without_public_leak(self):
+        response = self.post_report(
+            headers={
+                "User-Agent": "YT360 Test Browser",
+                "X-Forwarded-For": "203.0.113.99",
+            }
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertIn("application/json", response.headers["content-type"])
+        tracking_code = response.json()["tracking_code"]
+        with self.SessionTesting() as db:
+            report = db.scalar(select(Report).where(Report.tracking_code == tracking_code))
+            self.assertIsNotNone(report)
+            self.assertIsNotNone(report.reporter_ip_hash)
+            self.assertEqual(report.reporter_user_agent_hash, hash_technical_value("YT360 Test Browser"))
+            self.assertIsNotNone(report.request_fingerprint_hash)
+            self.assertIsNotNone(report.client_submitted_at)
+            metadata = json.loads(report.technical_metadata)
+
+        self.assertEqual(metadata["client_ip_source"], "direct")
+        self.assertFalse(metadata["forwarded_for_used"])
+        self.assertTrue(metadata["untrusted_forwarded_header_present"])
+        self.assertTrue(metadata["untrusted_forwarded_for_present"])
+        self.assertEqual(metadata["user_agent"], "YT360 Test Browser")
+        self.assertIn("observed_source_port", metadata)
+        self.assertEqual(
+            metadata["source_port_note"],
+            "Transport metadata only; not a device or person identifier.",
+        )
+
+        lookup_response = self.client.get(f"/api/public/reports/{tracking_code}")
+        self.assertEqual(lookup_response.status_code, 200)
+        self.assertIn("application/json", lookup_response.headers["content-type"])
+        lookup_body = lookup_response.json()
+        self.assertNotIn("reporter_ip_hash", lookup_body)
+        self.assertNotIn("reporter_user_agent_hash", lookup_body)
+        self.assertNotIn("request_fingerprint_hash", lookup_body)
+        self.assertNotIn("technical_metadata", lookup_body)
+        self.assertNotIn("203.0.113.99", lookup_response.text)
+        self.assertNotIn("YT360 Test Browser", lookup_response.text)
+
+    def test_trusted_proxy_forwarded_for_is_used_only_for_trusted_peer(self):
+        public_api.settings.trusted_proxy_ips = ["10.0.0.0/24"]
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="10.0.0.10", port=45678),
+            headers={
+                "x-forwarded-for": "203.0.113.7, 10.0.0.10",
+                "user-agent": "Proxy UA",
+            },
+        )
+
+        metadata = collect_report_technical_metadata(request)
+
+        self.assertEqual(metadata.reporter_ip_hash, hash_technical_value("203.0.113.7"))
+        self.assertEqual(metadata.reporter_user_agent_hash, hash_technical_value("Proxy UA"))
+        self.assertEqual(metadata.technical_metadata["client_ip_source"], "x-forwarded-for")
+        self.assertEqual(metadata.technical_metadata["client_ip"], "203.0.113.7")
+        self.assertEqual(metadata.technical_metadata["peer_ip"], "10.0.0.10")
+        self.assertEqual(metadata.technical_metadata["user_agent"], "Proxy UA")
+        self.assertTrue(metadata.technical_metadata["forwarded_for_used"])
+        self.assertEqual(metadata.technical_metadata["observed_source_port"], 45678)
+
+    def test_direct_ip_and_source_port_are_collected_from_peer(self):
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="198.51.100.23", port=51234),
+            headers={"user-agent": "Direct UA"},
+        )
+
+        metadata = collect_report_technical_metadata(request)
+
+        self.assertEqual(metadata.reporter_ip_hash, hash_technical_value("198.51.100.23"))
+        self.assertEqual(metadata.reporter_user_agent_hash, hash_technical_value("Direct UA"))
+        self.assertEqual(metadata.technical_metadata["client_ip"], "198.51.100.23")
+        self.assertEqual(metadata.technical_metadata["client_ip_source"], "direct")
+        self.assertEqual(metadata.technical_metadata["observed_source_port"], 51234)
+
+    def test_source_port_is_none_when_not_observed(self):
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="198.51.100.23", port=None),
+            headers={"user-agent": "No Port UA"},
+        )
+
+        metadata = collect_report_technical_metadata(request)
+
+        self.assertIsNone(metadata.technical_metadata["observed_source_port"])
+        self.assertEqual(
+            metadata.technical_metadata["source_port_note"],
+            "Transport metadata only; not a device or person identifier.",
+        )
+
+    def test_untrusted_forwarded_headers_are_ignored(self):
+        public_api.settings.trusted_proxy_ips = []
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="198.51.100.23", port=51234),
+            headers={
+                "x-forwarded-for": "203.0.113.7",
+                "x-real-ip": "203.0.113.8",
+                "user-agent": "Untrusted UA",
+            },
+        )
+
+        metadata = collect_report_technical_metadata(request)
+
+        self.assertEqual(metadata.reporter_ip_hash, hash_technical_value("198.51.100.23"))
+        self.assertEqual(metadata.technical_metadata["client_ip"], "198.51.100.23")
+        self.assertEqual(metadata.technical_metadata["client_ip_source"], "direct")
+        self.assertTrue(metadata.technical_metadata["untrusted_forwarded_header_present"])
+        self.assertTrue(metadata.technical_metadata["untrusted_real_ip_present"])
+
+    def test_trusted_proxy_real_ip_is_used_when_forwarded_for_absent(self):
+        public_api.settings.trusted_proxy_ips = ["10.0.0.0/24"]
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="10.0.0.10", port=45678),
+            headers={
+                "x-real-ip": "203.0.113.8",
+                "user-agent": "Real IP UA",
+            },
+        )
+
+        metadata = collect_report_technical_metadata(request)
+
+        self.assertEqual(metadata.reporter_ip_hash, hash_technical_value("203.0.113.8"))
+        self.assertEqual(metadata.technical_metadata["client_ip"], "203.0.113.8")
+        self.assertEqual(metadata.technical_metadata["client_ip_source"], "x-real-ip")
+        self.assertFalse(metadata.technical_metadata["forwarded_for_used"])
+
+    def test_user_agent_is_limited_before_storage(self):
+        long_user_agent = "A" * (USER_AGENT_MAX_LENGTH + 25)
+        request = SimpleNamespace(
+            client=SimpleNamespace(host="198.51.100.23", port=51234),
+            headers={"user-agent": long_user_agent},
+        )
+
+        metadata = collect_report_technical_metadata(request)
+
+        self.assertEqual(len(metadata.technical_metadata["user_agent"]), USER_AGENT_MAX_LENGTH)
+        self.assertEqual(
+            metadata.reporter_user_agent_hash,
+            hash_technical_value(long_user_agent[:USER_AGENT_MAX_LENGTH]),
+        )
 
     def test_create_report_rejects_invalid_category(self):
         before = self.count_reports()
@@ -215,14 +483,25 @@ class PublicReportsApiTests(unittest.TestCase):
     def test_upload_filename_path_traversal_is_not_used(self):
         response = self.post_report(files={"image": ("../../evil.png", PNG_BYTES, "image/png")})
 
-        self.assertEqual(response.status_code, 201)
-        with self.SessionTesting() as db:
-            report = db.scalar(select(Report).where(Report.tracking_code == response.json()["tracking_code"]))
-            attachment = db.scalar(select(Attachment).where(Attachment.report_id == report.id))
-            stored_path = (self.upload_dir / attachment.stored_filename).resolve()
-            self.assertTrue(stored_path.exists())
-            self.assertEqual(stored_path.parent, self.upload_dir.resolve())
-            self.assertNotIn("evil", attachment.stored_filename)
+        if response.status_code == 201:
+            with self.SessionTesting() as db:
+                report = db.scalar(select(Report).where(Report.tracking_code == response.json()["tracking_code"]))
+                attachment = db.scalar(select(Attachment).where(Attachment.report_id == report.id))
+                stored_path = (self.upload_dir / attachment.stored_filename).resolve()
+                self.assertTrue(stored_path.exists())
+                self.assertEqual(stored_path.parent, self.upload_dir.resolve())
+                self.assertNotIn("evil", attachment.stored_filename)
+        else:
+            self.assertEqual(response.status_code, 415)
+            self.assertFalse(self.upload_dir.exists())
+
+    def test_create_report_rejects_path_traversal_in_multiple_images(self):
+        before_reports = self.count_reports()
+        response = self.post_report(files=[("images", ("..\\evil.png", PNG_BYTES, "image/png"))])
+
+        self.assertEqual(response.status_code, 415)
+        self.assertEqual(self.count_reports(), before_reports)
+        self.assertFalse(self.upload_dir.exists())
 
     def test_tracking_code_is_unique(self):
         responses = [self.post_report() for _ in range(20)]
@@ -235,10 +514,81 @@ class PublicReportsApiTests(unittest.TestCase):
             db_codes = set(db.scalars(select(Report.tracking_code)).all())
             self.assertTrue(set(tracking_codes).issubset(db_codes))
 
+    def test_similar_recent_report_creates_duplicate_warning_only(self):
+        first = self.post_report(data={"description": "Cay do chan mot phan duong can xu ly som."})
+        second = self.post_report(data={"description": "Cay do chan duong can xu ly som tai khu vuc nay."})
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        with self.SessionTesting() as db:
+            report = db.scalar(select(Report).where(Report.tracking_code == second.json()["tracking_code"]))
+            links = db.scalars(select(ReportDuplicateLink).where(ReportDuplicateLink.report_id == report.id)).all()
+            self.assertTrue(report.is_duplicate)
+            self.assertEqual(len(links), 1)
+            self.assertEqual(links[0].status, DuplicateLinkStatus.SUGGESTED)
+            self.assertGreaterEqual(links[0].score, public_api.settings.duplicate_similarity_threshold)
+
+    def test_same_category_different_area_is_not_marked_duplicate(self):
+        other_area_id = self.create_active_area()
+        self.assertEqual(self.post_report(data={"description": "Mat nap cong bi vo can sua gap."}).status_code, 201)
+        response = self.post_report(
+            data={
+                "area_id": str(other_area_id),
+                "description": "Mat nap cong bi vo can sua gap.",
+            }
+        )
+
+        self.assertEqual(response.status_code, 201)
+        with self.SessionTesting() as db:
+            report = db.scalar(select(Report).where(Report.tracking_code == response.json()["tracking_code"]))
+            self.assertFalse(report.is_duplicate)
+        self.assertEqual(self.count_duplicate_links(), 0)
+
+    def test_same_area_different_category_is_not_marked_duplicate(self):
+        other_category_id = self.create_active_category()
+        self.assertEqual(self.post_report(data={"description": "Rac thai tap ket sai noi quy."}).status_code, 201)
+        response = self.post_report(
+            data={
+                "category_id": str(other_category_id),
+                "description": "Rac thai tap ket sai noi quy.",
+            }
+        )
+
+        self.assertEqual(response.status_code, 201)
+        with self.SessionTesting() as db:
+            report = db.scalar(select(Report).where(Report.tracking_code == response.json()["tracking_code"]))
+            self.assertFalse(report.is_duplicate)
+        self.assertEqual(self.count_duplicate_links(), 0)
+
+    def test_old_similar_report_outside_window_is_not_marked_duplicate(self):
+        public_api.settings.duplicate_detection_window_hours = 1
+        with self.SessionTesting() as db:
+            db.add(
+                Report(
+                    tracking_code="YT360-OLD111",
+                    category_id=self.category_id,
+                    area_id=self.area_id,
+                    description="Den duong hu hong can sua gap.",
+                    status=ReportStatus.NEW,
+                    created_at=datetime.now(timezone.utc) - timedelta(hours=3),
+                )
+            )
+            db.commit()
+
+        response = self.post_report(data={"description": "Den duong hu hong can sua gap."})
+
+        self.assertEqual(response.status_code, 201)
+        with self.SessionTesting() as db:
+            report = db.scalar(select(Report).where(Report.tracking_code == response.json()["tracking_code"]))
+            self.assertFalse(report.is_duplicate)
+        self.assertEqual(self.count_duplicate_links(), 0)
+
     def test_rate_limit_rejects_excess_requests(self):
         public_api.settings.public_report_rate_limit = 2
         public_api.settings.public_report_rate_limit_window_seconds = 60
+        public_api.settings.public_report_spam_flag_threshold = 10
         public_report_limiter.reset()
+        public_report_rapid_limiter.reset()
 
         self.assertEqual(self.post_report().status_code, 201)
         self.assertEqual(self.post_report().status_code, 201)
@@ -247,6 +597,121 @@ class PublicReportsApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 429)
         self.assertNotIn("password", response.text.lower())
         self.assertNotIn("traceback", response.text.lower())
+
+    def test_rate_limit_window_expiry_allows_new_report(self):
+        public_api.settings.public_report_rate_limit = 2
+        public_api.settings.public_report_rate_limit_window_seconds = 60
+        public_api.settings.public_report_spam_flag_threshold = 10
+        public_report_limiter.reset()
+        public_report_rapid_limiter.reset()
+
+        with patch("app.core.rate_limit.monotonic", side_effect=[0, 0, 1, 1, 61, 61]):
+            self.assertEqual(self.post_report(data={"description": "Window 1"}).status_code, 201)
+            self.assertEqual(self.post_report(data={"description": "Window 2"}).status_code, 201)
+            response = self.post_report(data={"description": "Window 3"})
+
+        self.assertEqual(response.status_code, 201)
+
+    def test_untrusted_forwarded_for_does_not_bypass_ip_rate_limit(self):
+        public_api.settings.trusted_proxy_ips = []
+        public_api.settings.public_report_rate_limit = 2
+        public_api.settings.public_report_rate_limit_window_seconds = 60
+        public_api.settings.public_report_spam_flag_threshold = 10
+        public_report_limiter.reset()
+        public_report_rapid_limiter.reset()
+
+        self.assertEqual(self.post_report(headers={"X-Forwarded-For": "203.0.113.1"}).status_code, 201)
+        self.assertEqual(self.post_report(headers={"X-Forwarded-For": "203.0.113.2"}).status_code, 201)
+        response = self.post_report(headers={"X-Forwarded-For": "203.0.113.3"})
+
+        self.assertEqual(response.status_code, 429)
+
+    def test_different_rate_limit_keys_do_not_share_counter(self):
+        public_api.settings.public_report_rate_limit = 1
+        public_report_limiter.reset()
+
+        public_report_limiter.check("ip-a", limit=1, window_seconds=60)
+        public_report_limiter.check("ip-b", limit=1, window_seconds=60)
+
+        with self.assertRaises(Exception):
+            public_report_limiter.check("ip-a", limit=1, window_seconds=60)
+
+    def test_rapid_repeated_reports_are_flagged_not_blocked_when_under_rate_limit(self):
+        public_api.settings.public_report_rate_limit = 100
+        public_api.settings.public_report_rapid_limit = 10
+        public_api.settings.public_report_spam_flag_threshold = 2
+        public_report_limiter.reset()
+        public_report_rapid_limiter.reset()
+
+        first = self.post_report()
+        second = self.post_report()
+
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 201)
+        with self.SessionTesting() as db:
+            first_report = db.scalar(select(Report).where(Report.tracking_code == first.json()["tracking_code"]))
+            second_report = db.scalar(select(Report).where(Report.tracking_code == second.json()["tracking_code"]))
+            self.assertFalse(first_report.is_spam)
+            self.assertTrue(second_report.is_spam)
+            self.assertGreaterEqual(second_report.spam_score, 0.7)
+            self.assertEqual(second_report.moderation_status, "FLAGGED")
+            self.assertIn("anti_spam", json.loads(second_report.technical_metadata))
+
+    def test_rapid_limit_rejects_after_burst_threshold(self):
+        public_api.settings.public_report_rate_limit = 100
+        public_api.settings.public_report_rapid_limit = 2
+        public_api.settings.public_report_spam_flag_threshold = 2
+        public_report_limiter.reset()
+        public_report_rapid_limiter.reset()
+
+        self.assertEqual(self.post_report().status_code, 201)
+        self.assertEqual(self.post_report().status_code, 201)
+        response = self.post_report()
+
+        self.assertEqual(response.status_code, 429)
+        self.assertIn("application/json", response.headers["content-type"])
+        self.assertNotIn("<!doctype", response.text.lower())
+
+    def test_active_source_block_rejects_new_report_without_creating_data(self):
+        public_api.settings.trusted_proxy_ips = []
+        blocked_ip_hash = hash_technical_value("testclient")
+        with self.SessionTesting() as db:
+            db.add(ReportSourceBlock(source_type="IP", source_hash=blocked_ip_hash, reason="Test block"))
+            db.commit()
+        before = self.count_reports()
+
+        response = self.post_report(headers={"User-Agent": "Blocked UA"})
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(self.count_reports(), before)
+
+    def test_rate_limiter_is_thread_safe_under_concurrent_requests(self):
+        public_report_limiter.reset()
+
+        def record_request(_index):
+            return public_report_limiter.record("concurrent-test", 60)
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            counts = list(executor.map(record_request, range(20)))
+
+        self.assertEqual(sorted(counts), list(range(1, 21)))
+
+    def test_concurrent_report_requests_respect_rate_limit_without_race(self):
+        public_api.settings.public_report_rate_limit = 5
+        public_api.settings.public_report_rate_limit_window_seconds = 60
+        public_api.settings.public_report_spam_flag_threshold = 20
+        public_report_limiter.reset()
+        public_report_rapid_limiter.reset()
+
+        def submit_report(index):
+            return self.post_report(data={"description": f"Concurrent report {index}"}).status_code
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            statuses = list(executor.map(submit_report, range(8)))
+
+        self.assertEqual(statuses.count(201), 5)
+        self.assertEqual(statuses.count(429), 3)
+        self.assertEqual(self.count_reports(), 5)
 
     def create_report_for_lookup(self, status=ReportStatus.COORDINATING):
         with self.SessionTesting() as db:

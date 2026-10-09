@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -16,7 +17,21 @@ from app.core.security import hash_password
 from app.db.base import Base
 from app.db.dependencies import get_db
 from app.main import create_app
-from app.models import Area, Attachment, AuditLog, Category, Report, ReportStatus, StatusHistory, User
+from app.models import (
+    Area,
+    Attachment,
+    AuditLog,
+    Category,
+    DuplicateLinkStatus,
+    Report,
+    ReportDuplicateLink,
+    ReportSourceBlock,
+    ReportStatus,
+    StatusHistory,
+    User,
+)
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
 
 
 class AuthApiTests(unittest.TestCase):
@@ -488,6 +503,39 @@ class AuthApiTests(unittest.TestCase):
         )
         self.assertEqual(self.client.get("/api/admin/users", headers=self.auth_headers()).status_code, 200)
 
+    def test_admin_can_list_audit_logs_without_sensitive_fields(self):
+        admin_headers = self.auth_headers("admin", "admin-password")
+        receiver_headers = self.auth_headers("receiver", "receiver-password")
+
+        created = self.client.post(
+            "/api/admin/categories",
+            json={"name": "Audit category", "icon": "audit", "is_active": True, "display_order": 11},
+            headers=admin_headers,
+        )
+        self.assertEqual(created.status_code, 201)
+
+        no_auth = self.client.get("/api/admin/audit-logs")
+        receiver = self.client.get("/api/admin/audit-logs", headers=receiver_headers)
+        response = self.client.get("/api/admin/audit-logs", headers=admin_headers)
+
+        self.assertEqual(no_auth.status_code, 401)
+        self.assertEqual(receiver.status_code, 403)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertGreaterEqual(body["total"], 1)
+        self.assertEqual(body["page"], 1)
+        self.assertEqual(body["page_size"], 20)
+        first = body["items"][0]
+        self.assertIn(
+            first["action"],
+            {"CATEGORY_CREATE", "AREA_CREATE", "USER_CREATE", "USER_UPDATE", "USER_PASSWORD_RESET", "REPORT_RECEIVE"},
+        )
+        self.assertIn("created_at", first)
+        self.assertIn("user", first)
+        self.assertNotIn("password_hash", response.text.lower())
+        self.assertNotIn("admin-password", response.text.lower())
+        self.assertNotIn("receiver-password", response.text.lower())
+
     def test_update_user_role_affects_new_login_and_backend_authorization(self):
         headers = self.auth_headers("admin", "admin-password")
         created = self.client.post(
@@ -742,7 +790,183 @@ class AuthApiTests(unittest.TestCase):
         self.assertTrue(body["area"])
         self.assertEqual(body["status"], "NEW")
         self.assertEqual(body["attachments"][0]["original_filename"], "test-image.png")
+        self.assertEqual(body["attachments"][0]["attachment_type"], "INITIAL")
+        self.assertFalse(body["attachments"][0]["is_public"])
+        self.assertEqual(body["duplicate_links"], [])
         self.assertEqual(body["status_history"], [])
+
+    def test_admin_can_link_related_reports_without_merging_originals(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        related_report_id = self.report_id("YT360-BBBBBB")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/related-reports",
+            json={"related_report_id": related_report_id, "reason": "Same incident reported twice"},
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        no_auth_response = self.client.post(
+            f"/api/admin/reports/{report_id}/related-reports",
+            json={"related_report_id": related_report_id},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(no_auth_response.status_code, 401)
+        body = response.json()
+        self.assertEqual(body["related_report_id"], related_report_id)
+        self.assertEqual(body["related_tracking_code"], "YT360-BBBBBB")
+        self.assertEqual(body["status"], "LINKED")
+
+        detail = self.client.get(f"/api/admin/reports/{report_id}", headers=self.auth_headers())
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["duplicate_links"][0]["related_tracking_code"], "YT360-BBBBBB")
+        with self.SessionTesting() as db:
+            self.assertIsNotNone(db.get(Report, report_id))
+            self.assertIsNotNone(db.get(Report, related_report_id))
+            link = db.query(ReportDuplicateLink).one()
+            self.assertEqual(link.status, DuplicateLinkStatus.LINKED)
+
+    def test_related_report_link_rejects_self_link(self):
+        report_id = self.report_id("YT360-AAAAAA")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/related-reports",
+            json={"related_report_id": report_id},
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_handler_can_upload_processing_images_but_receiver_cannot(self):
+        report_id = self.report_id("YT360-AAAAAA")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/attachments",
+            data={"attachment_type": "AFTER"},
+            files=[
+                ("images", ("after-1.png", PNG_BYTES, "image/png")),
+                ("images", ("after-2.png", PNG_BYTES, "image/png")),
+            ],
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        receiver_response = self.client.post(
+            f"/api/admin/reports/{report_id}/attachments",
+            data={"attachment_type": "AFTER"},
+            files=[("images", ("after-3.png", PNG_BYTES, "image/png"))],
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(receiver_response.status_code, 403)
+        attachments = response.json()["attachments"]
+        after_images = [item for item in attachments if item["attachment_type"] == "AFTER"]
+        self.assertEqual(len(after_images), 2)
+        self.assertTrue(all(not item["is_public"] for item in after_images))
+        with self.SessionTesting() as db:
+            stored = db.query(Attachment).filter(Attachment.report_id == report_id).all()
+            self.assertEqual(len([item for item in stored if item.attachment_type.value == "AFTER"]), 2)
+
+    def test_processing_image_upload_rejects_initial_type(self):
+        report_id = self.report_id("YT360-AAAAAA")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/attachments",
+            data={"attachment_type": "INITIAL"},
+            files=[("images", ("fake-initial.png", PNG_BYTES, "image/png"))],
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_processing_image_upload_rejects_empty_file_list(self):
+        report_id = self.report_id("YT360-AAAAAA")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/attachments",
+            data={"attachment_type": "AFTER"},
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+
+        self.assertIn(response.status_code, {400, 422})
+
+    def test_admin_only_report_technical_metadata_endpoint(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        with self.SessionTesting() as db:
+            report = db.get(Report, report_id)
+            report.reporter_ip_hash = "ip-hash"
+            report.reporter_user_agent_hash = "ua-hash"
+            report.request_fingerprint_hash = "fingerprint-hash"
+            report.client_submitted_at = datetime(2026, 10, 7, 9, 30, 0)
+            report.technical_metadata = json.dumps(
+                {
+                    "client_ip_source": "direct",
+                    "client_ip": "192.0.2.1",
+                    "user_agent": "Admin visible UA",
+                    "observed_source_port": 45678,
+                    "source_port_note": "Transport metadata only; not a device or person identifier.",
+                }
+            )
+            db.commit()
+
+        admin_response = self.client.get(
+            f"/api/admin/reports/{report_id}/technical",
+            headers=self.auth_headers(),
+        )
+        receiver_response = self.client.get(
+            f"/api/admin/reports/{report_id}/technical",
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+        no_auth_response = self.client.get(f"/api/admin/reports/{report_id}/technical")
+
+        self.assertEqual(admin_response.status_code, 200)
+        body = admin_response.json()
+        self.assertEqual(body["tracking_code"], "YT360-AAAAAA")
+        self.assertEqual(body["reporter_ip_hash"], "ip-hash")
+        self.assertEqual(body["reporter_user_agent_hash"], "ua-hash")
+        self.assertEqual(body["request_fingerprint_hash"], "fingerprint-hash")
+        self.assertEqual(body["technical_metadata"]["client_ip"], "192.0.2.1")
+        self.assertEqual(body["technical_metadata"]["user_agent"], "Admin visible UA")
+        self.assertEqual(body["technical_metadata"]["observed_source_port"], 45678)
+        self.assertEqual(receiver_response.status_code, 403)
+        self.assertEqual(no_auth_response.status_code, 401)
+
+    def test_admin_can_block_and_unblock_report_source(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        with self.SessionTesting() as db:
+            report = db.get(Report, report_id)
+            report.reporter_ip_hash = "ip-hash-for-block"
+            report.request_fingerprint_hash = "fingerprint-hash-for-block"
+            db.commit()
+
+        headers = self.auth_headers()
+        block_response = self.client.post(
+            f"/api/admin/reports/{report_id}/source-blocks",
+            json={"source_type": "FINGERPRINT", "reason": "Repeated abuse"},
+            headers=headers,
+        )
+        receiver_response = self.client.post(
+            f"/api/admin/reports/{report_id}/source-blocks",
+            json={"source_type": "FINGERPRINT"},
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+
+        self.assertEqual(block_response.status_code, 201)
+        body = block_response.json()
+        self.assertEqual(body["source_type"], "FINGERPRINT")
+        self.assertEqual(body["source_hash"], "fingerprint-hash-for-block")
+        self.assertTrue(body["is_active"])
+        self.assertEqual(receiver_response.status_code, 403)
+
+        technical_response = self.client.get(f"/api/admin/reports/{report_id}/technical", headers=headers)
+        self.assertEqual(technical_response.status_code, 200)
+        self.assertEqual(len(technical_response.json()["active_source_blocks"]), 1)
+
+        unblock_response = self.client.post(f"/api/admin/source-blocks/{body['id']}/unblock", headers=headers)
+        self.assertEqual(unblock_response.status_code, 200)
+        self.assertFalse(unblock_response.json()["is_active"])
+        with self.SessionTesting() as db:
+            source_block = db.get(ReportSourceBlock, body["id"])
+            self.assertFalse(source_block.is_active)
+            self.assertIsNotNone(source_block.lifted_at)
 
     def test_valid_receive_transition_updates_report_history_and_audit_log(self):
         report_id = self.report_id("YT360-AAAAAA")
@@ -1069,6 +1293,16 @@ class AuthApiTests(unittest.TestCase):
             report.created_at = datetime(2026, 9, 30, 16, 59, 59)
             report.updated_at = datetime(2026, 9, 30, 16, 59, 59)
             report.internal_note = "SECRET INTERNAL NOTE MUST NOT EXPORT"
+            report.reporter_ip_hash = "IP HASH MUST NOT EXPORT"
+            report.reporter_user_agent_hash = "UA HASH MUST NOT EXPORT"
+            report.request_fingerprint_hash = "FINGERPRINT MUST NOT EXPORT"
+            report.technical_metadata = json.dumps(
+                {
+                    "client_ip": "203.0.113.77",
+                    "observed_source_port": 54321,
+                    "user_agent": "SECRET USER AGENT MUST NOT EXPORT",
+                }
+            )
             category.name = "@TEST Category"
             area.name = "-TEST Area"
             db.commit()
@@ -1096,8 +1330,8 @@ class AuthApiTests(unittest.TestCase):
         self.assertIn("Mã phản ánh", sheet_xml)
         self.assertIn("Ngày tiếp nhận", sheet_xml)
         self.assertIn("YT360-AAAAAA", sheet_xml)
-        self.assertIn("@TEST Category", sheet_xml)
-        self.assertIn("-TEST Area", sheet_xml)
+        self.assertIn("'@TEST Category", sheet_xml)
+        self.assertIn("'-TEST Area", sheet_xml)
         self.assertIn("Mới", sheet_xml)
         self.assertEqual(sheet_xml.count("<row "), 2)
         self.assertNotIn("password", sheet_xml.lower())
@@ -1105,6 +1339,12 @@ class AuthApiTests(unittest.TestCase):
         self.assertNotIn("token", sheet_xml.lower())
         self.assertNotIn("audit", sheet_xml.lower())
         self.assertNotIn("SECRET INTERNAL NOTE", sheet_xml)
+        self.assertNotIn("IP HASH MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("UA HASH MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("FINGERPRINT MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("203.0.113.77", sheet_xml)
+        self.assertNotIn("54321", sheet_xml)
+        self.assertNotIn("SECRET USER AGENT", sheet_xml)
         self.assertNotIn("<f>", sheet_xml)
         self.assertIn('t="inlineStr"', sheet_xml)
 

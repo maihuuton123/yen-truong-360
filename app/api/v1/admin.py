@@ -6,7 +6,7 @@ from urllib.parse import quote
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
@@ -14,23 +14,44 @@ from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.api.dependencies import require_roles
 from app.api.v1.auth import auth_user_out
+from app.api.v1.public import cleanup_saved_files, normalized_uploads, prepare_image_uploads, save_upload_file
 from app.core.config import settings
 from app.core.qr import build_qr_svg
 from app.core.security import hash_password
 from app.db.dependencies import get_db
-from app.models import Area, Attachment, AuditLog, Category, Report, ReportStatus, StatusHistory, User
+from app.models import (
+    Area,
+    Attachment,
+    AttachmentType,
+    AuditLog,
+    Category,
+    DuplicateLinkStatus,
+    Report,
+    ReportDuplicateLink,
+    ReportSourceBlock,
+    ReportStatus,
+    StatusHistory,
+    User,
+)
 from app.schemas.admin import (
     AdminAreaIn,
     AdminAreaOut,
     AdminAttachmentOut,
+    AdminAuditLogListOut,
+    AdminAuditLogOut,
     AdminCategoryIn,
     AdminCategoryOut,
     AdminDashboardOut,
     AdminMetricOut,
     AdminQrOut,
     AdminReportDetailOut,
+    AdminReportDuplicateLinkIn,
+    AdminReportDuplicateLinkOut,
     AdminReportListItemOut,
     AdminReportListOut,
+    AdminReportSourceBlockIn,
+    AdminReportSourceBlockOut,
+    AdminReportTechnicalOut,
     AdminReportTransitionIn,
     AdminStatisticBucketOut,
     AdminStatisticsOut,
@@ -260,6 +281,169 @@ def get_report_detail(
 ) -> AdminReportDetailOut:
     _ = user
     return report_detail_out(load_report_or_404(db, report_id))
+
+
+@router.get("/reports/{report_id}/technical", response_model=AdminReportTechnicalOut)
+def get_report_technical_metadata(
+    report_id: int,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminReportTechnicalOut:
+    _ = user
+    return report_technical_out(load_report_or_404(db, report_id), db)
+
+
+@router.post("/reports/{report_id}/related-reports", response_model=AdminReportDuplicateLinkOut, status_code=status.HTTP_201_CREATED)
+def link_related_report(
+    report_id: int,
+    payload: AdminReportDuplicateLinkIn,
+    user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
+    db: Session = Depends(get_db),
+) -> AdminReportDuplicateLinkOut:
+    report = load_report_or_404(db, report_id)
+    related = load_report_or_404(db, payload.related_report_id)
+    if report.id == related.id:
+        raise HTTPException(status_code=422, detail="Khong the lien ket phan anh voi chinh no.")
+
+    existing = db.scalar(
+        select(ReportDuplicateLink).where(
+            or_(
+                (ReportDuplicateLink.report_id == report.id)
+                & (ReportDuplicateLink.related_report_id == related.id),
+                (ReportDuplicateLink.report_id == related.id)
+                & (ReportDuplicateLink.related_report_id == report.id),
+            )
+        )
+    )
+    if existing is None:
+        link = ReportDuplicateLink(
+            report_id=report.id,
+            related_report_id=related.id,
+            status=DuplicateLinkStatus.LINKED,
+            score=None,
+            reason=clean_text(payload.reason),
+            created_by=user.id,
+        )
+        db.add(link)
+        db.flush()
+    else:
+        link = existing
+        link.status = DuplicateLinkStatus.LINKED
+        link.reason = clean_text(payload.reason) or link.reason
+        link.created_by = link.created_by or user.id
+
+    report.is_duplicate = True
+    related.is_duplicate = True
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="REPORT_DUPLICATE_LINK",
+            entity_type="report_duplicate_link",
+            entity_id=link.id,
+            details=json.dumps(
+                {
+                    "report_id": report.id,
+                    "related_report_id": related.id,
+                    "tracking_code": report.tracking_code,
+                    "related_tracking_code": related.tracking_code,
+                    "has_reason": bool(clean_text(payload.reason)),
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    db.refresh(link)
+    return duplicate_link_out(link, report.id)
+
+
+@router.post("/reports/{report_id}/source-blocks", response_model=AdminReportSourceBlockOut, status_code=status.HTTP_201_CREATED)
+def block_report_source(
+    report_id: int,
+    payload: AdminReportSourceBlockIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminReportSourceBlockOut:
+    report = load_report_or_404(db, report_id)
+    source_hash = report_source_hash(report, payload.source_type)
+    if not source_hash:
+        raise HTTPException(status_code=422, detail="Khong co metadata phu hop de chan nguon nay.")
+
+    now = datetime.now(timezone.utc)
+    existing = db.scalar(
+        select(ReportSourceBlock)
+        .where(
+            ReportSourceBlock.source_type == payload.source_type,
+            ReportSourceBlock.source_hash == source_hash,
+            ReportSourceBlock.is_active.is_(True),
+            or_(ReportSourceBlock.expires_at.is_(None), ReportSourceBlock.expires_at > now),
+        )
+        .order_by(ReportSourceBlock.created_at.desc(), ReportSourceBlock.id.desc())
+    )
+    if existing is not None:
+        return source_block_out(existing)
+
+    source_block = ReportSourceBlock(
+        source_type=payload.source_type,
+        source_hash=source_hash,
+        reason=clean_text(payload.reason),
+        expires_at=payload.expires_at,
+        created_by=user.id,
+    )
+    db.add(source_block)
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="REPORT_SOURCE_BLOCK",
+            entity_type="report_source_block",
+            details=json.dumps(
+                {
+                    "report_id": report.id,
+                    "tracking_code": report.tracking_code,
+                    "source_type": payload.source_type,
+                    "has_reason": bool(clean_text(payload.reason)),
+                    "expires_at": payload.expires_at.isoformat() if payload.expires_at else None,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    db.refresh(source_block)
+    return source_block_out(source_block)
+
+
+@router.post("/source-blocks/{block_id}/unblock", response_model=AdminReportSourceBlockOut)
+def unblock_report_source(
+    block_id: int,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminReportSourceBlockOut:
+    source_block = db.get(ReportSourceBlock, block_id)
+    if source_block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Khong tim thay nguon bi chan.")
+    if source_block.is_active:
+        source_block.is_active = False
+        source_block.lifted_at = datetime.now(timezone.utc)
+        source_block.lifted_by = user.id
+        db.add(
+            AuditLog(
+                user_id=user.id,
+                action="REPORT_SOURCE_UNBLOCK",
+                entity_type="report_source_block",
+                entity_id=source_block.id,
+                details=json.dumps(
+                    {
+                        "source_type": source_block.source_type,
+                        "source_hash": source_block.source_hash,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        db.commit()
+        db.refresh(source_block)
+    return source_block_out(source_block)
 
 
 @router.get("/categories", response_model=list[AdminCategoryOut])
@@ -557,6 +741,66 @@ def get_report_attachment(
     return FileResponse(path, media_type=attachment.mime_type, filename=attachment.original_filename)
 
 
+@router.post("/reports/{report_id}/attachments", response_model=AdminReportDetailOut, status_code=status.HTTP_201_CREATED)
+async def upload_report_processing_attachments(
+    report_id: int,
+    attachment_type: str = Form(...),
+    images: list[UploadFile] = File(...),
+    user: User = Depends(require_roles("ADMIN", "HANDLER")),
+    db: Session = Depends(get_db),
+) -> AdminReportDetailOut:
+    report = load_report_or_404(db, report_id)
+    try:
+        parsed_type = AttachmentType(attachment_type)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Loai anh xu ly khong hop le.") from exc
+    if parsed_type == AttachmentType.INITIAL:
+        raise HTTPException(status_code=422, detail="API nay chi dung cho anh xu ly, khong dung cho anh ban dau.")
+
+    uploaded_images = normalized_uploads(image=None, images=images)
+    if not uploaded_images:
+        raise HTTPException(status_code=422, detail="Vui long tai len it nhat mot anh xu ly.")
+    attachment_data = await prepare_image_uploads(uploaded_images)
+    saved_file_paths: list[Path] = []
+    try:
+        for stored_filename, original_filename, mime_type, content in attachment_data:
+            saved_file_paths.append(save_upload_file(stored_filename, content))
+            db.add(
+                Attachment(
+                    report_id=report.id,
+                    stored_filename=stored_filename,
+                    original_filename=original_filename,
+                    mime_type=mime_type,
+                    file_size=len(content),
+                    attachment_type=parsed_type,
+                    is_public=False,
+                )
+            )
+        db.add(
+            AuditLog(
+                user_id=user.id,
+                action="REPORT_ATTACHMENT_UPLOAD",
+                entity_type="report",
+                entity_id=report.id,
+                details=json.dumps(
+                    {
+                        "tracking_code": report.tracking_code,
+                        "attachment_type": parsed_type.value,
+                        "count": len(attachment_data),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        cleanup_saved_files(saved_file_paths)
+        raise
+
+    return report_detail_out(load_report_or_404(db, report.id))
+
+
 @router.post("/reports/{report_id}/receive", response_model=AdminReportDetailOut)
 def receive_report(
     report_id: int,
@@ -635,6 +879,42 @@ def mark_report_out_of_scope(
         payload=payload,
         update_public_response=bool(clean_text(payload.public_note)),
     )
+
+
+@router.get("/audit-logs", response_model=AdminAuditLogListOut)
+def list_audit_logs(
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+    action: str | None = Query(default=None, max_length=120),
+    entity_type: str | None = Query(default=None, max_length=80),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=100),
+) -> AdminAuditLogListOut:
+    _ = user
+    filters = []
+    if action:
+        filters.append(AuditLog.action.ilike(f"%{action.strip()}%"))
+    if entity_type:
+        filters.append(AuditLog.entity_type == entity_type.strip().lower())
+
+    total_statement = select(func.count()).select_from(AuditLog)
+    if filters:
+        total_statement = total_statement.where(*filters)
+    total = db.scalar(total_statement) or 0
+
+    statement = (
+        select(AuditLog)
+        .options(joinedload(AuditLog.user))
+        .order_by(AuditLog.created_at.desc(), AuditLog.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    if filters:
+        statement = statement.where(*filters)
+
+    items = [audit_log_out(item) for item in db.scalars(statement).all()]
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return AdminAuditLogListOut(items=items, total=total, page=page, page_size=page_size, total_pages=total_pages)
 
 
 @router.get("/system")
@@ -723,15 +1003,15 @@ def build_statistics_out(db: Session, filters: list) -> AdminStatisticsOut:
     if filters:
         area_statement = area_statement.where(*filters)
 
-    local_report_day = func.date(Report.created_at, "+7 hours")
-    date_statement = (
-        select(local_report_day, func.count(Report.id))
-        .select_from(Report)
-        .group_by(local_report_day)
-        .order_by(local_report_day.asc())
-    )
+    date_statement = select(Report.created_at).select_from(Report).order_by(Report.created_at.asc())
     if filters:
         date_statement = date_statement.where(*filters)
+    date_counts: dict[date, int] = {}
+    for created_at in db.execute(date_statement).scalars().all():
+        if created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=timezone.utc)
+        local_day = created_at.astimezone(VIETNAM_TZ).date()
+        date_counts[local_day] = date_counts.get(local_day, 0) + 1
 
     return AdminStatisticsOut(
         total_reports=count_for(),
@@ -749,8 +1029,8 @@ def build_statistics_out(db: Session, filters: list) -> AdminStatisticsOut:
             for area_id, name, count in db.execute(area_statement).all()
         ],
         by_date=[
-            AdminStatisticBucketOut(key=str(day), label=format_statistics_day(day), value=count)
-            for day, count in db.execute(date_statement).all()
+            AdminStatisticBucketOut(key=day.isoformat(), label=format_statistics_day(day), value=count)
+            for day, count in sorted(date_counts.items())
         ],
     )
 
@@ -833,7 +1113,7 @@ def build_worksheet_xml(headers: list[str], rows: list[list[object]]) -> str:
                 cells.append(f'<c r="{coordinate}"{style}><v>{value}</v></c>')
             else:
                 cells.append(
-                    f'<c r="{coordinate}" t="inlineStr"{style}><is><t>{escape(str(value or ""))}</t></is></c>'
+                    f'<c r="{coordinate}" t="inlineStr"{style}><is><t>{escape(sanitize_excel_text(value))}</t></is></c>'
                 )
         xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
     return (
@@ -851,6 +1131,13 @@ def excel_column_name(index: int) -> str:
         index, remainder = divmod(index - 1, 26)
         name = chr(65 + remainder) + name
     return name
+
+
+def sanitize_excel_text(value: object) -> str:
+    text = str(value or "")
+    if text.startswith(("=", "+", "-", "@")):
+        return f"'{text}"
+    return text
 
 
 def load_category_or_404(db: Session, category_id: int) -> Category:
@@ -906,6 +1193,46 @@ def admin_user_out(user: User) -> AdminUserOut:
         is_active=user.is_active,
         created_at=user.created_at,
     )
+
+
+def audit_log_out(item: AuditLog) -> AdminAuditLogOut:
+    return AdminAuditLogOut(
+        id=item.id,
+        action=item.action,
+        entity_type=item.entity_type,
+        entity_id=item.entity_id,
+        details=redact_audit_details(item.details),
+        request_id=item.request_id,
+        actor_ip_hash=item.actor_ip_hash,
+        actor_user_agent_hash=item.actor_user_agent_hash,
+        created_at=item.created_at,
+        user=auth_user_out(item.user) if item.user else None,
+    )
+
+
+def redact_audit_details(details: str | None) -> str | None:
+    if not details:
+        return details
+    lowered = details.lower()
+    if "password" not in lowered and "token" not in lowered and "secret" not in lowered:
+        return details
+
+    try:
+        value = json.loads(details)
+    except json.JSONDecodeError:
+        return "[redacted]"
+
+    def redact_value(raw: object) -> object:
+        if isinstance(raw, dict):
+            return {
+                key: "[redacted]" if any(marker in key.lower() for marker in ("password", "token", "secret")) else redact_value(val)
+                for key, val in raw.items()
+            }
+        if isinstance(raw, list):
+            return [redact_value(item) for item in raw]
+        return raw
+
+    return json.dumps(redact_value(value), ensure_ascii=False)
 
 
 def require_clean_username(value: str) -> str:
@@ -969,6 +1296,8 @@ def load_report_or_404(db: Session, report_id: int) -> Report:
             selectinload(Report.category),
             selectinload(Report.area),
             selectinload(Report.attachments),
+            selectinload(Report.duplicate_links).selectinload(ReportDuplicateLink.related_report),
+            selectinload(Report.related_duplicate_links).selectinload(ReportDuplicateLink.report),
             selectinload(Report.status_history).selectinload(StatusHistory.changed_by_user),
         )
         .where(Report.id == report_id)
@@ -1152,7 +1481,98 @@ def build_internal_note(payload: AdminReportTransitionIn) -> str | None:
     return "\n".join(pieces) if pieces else None
 
 
+def report_technical_out(report: Report, db: Session) -> AdminReportTechnicalOut:
+    metadata: dict[str, object] | None = None
+    if report.technical_metadata:
+        try:
+            parsed_metadata = json.loads(report.technical_metadata)
+        except json.JSONDecodeError:
+            parsed_metadata = None
+        if isinstance(parsed_metadata, dict):
+            metadata = parsed_metadata
+
+    return AdminReportTechnicalOut(
+        id=report.id,
+        tracking_code=report.tracking_code,
+        reporter_ip_hash=report.reporter_ip_hash,
+        reporter_user_agent_hash=report.reporter_user_agent_hash,
+        request_fingerprint_hash=report.request_fingerprint_hash,
+        client_submitted_at=report.client_submitted_at,
+        technical_metadata=metadata,
+        active_source_blocks=active_source_blocks_for_report(report, db),
+    )
+
+
+def active_source_blocks_for_report(report: Report, db: Session) -> list[AdminReportSourceBlockOut]:
+    hashes = [
+        ("IP", report.reporter_ip_hash),
+        ("FINGERPRINT", report.request_fingerprint_hash),
+    ]
+    active_blocks: list[AdminReportSourceBlockOut] = []
+    now = datetime.now(timezone.utc)
+    for source_type, source_hash in hashes:
+        if not source_hash:
+            continue
+        blocks = db.scalars(
+            select(ReportSourceBlock)
+            .where(
+                ReportSourceBlock.source_type == source_type,
+                ReportSourceBlock.source_hash == source_hash,
+                ReportSourceBlock.is_active.is_(True),
+                or_(ReportSourceBlock.expires_at.is_(None), ReportSourceBlock.expires_at > now),
+            )
+            .order_by(ReportSourceBlock.created_at.desc(), ReportSourceBlock.id.desc())
+        ).all()
+        active_blocks.extend(source_block_out(block) for block in blocks)
+    return active_blocks
+
+
+def report_source_hash(report: Report, source_type: str) -> str | None:
+    if source_type == "IP":
+        return report.reporter_ip_hash
+    if source_type == "FINGERPRINT":
+        return report.request_fingerprint_hash
+    return None
+
+
+def source_block_out(source_block: ReportSourceBlock) -> AdminReportSourceBlockOut:
+    return AdminReportSourceBlockOut(
+        id=source_block.id,
+        source_type=source_block.source_type,
+        source_hash=source_block.source_hash,
+        reason=source_block.reason,
+        is_active=source_block.is_active,
+        expires_at=source_block.expires_at,
+        lifted_at=source_block.lifted_at,
+        created_at=source_block.created_at,
+        created_by=auth_user_out(source_block.created_by_user) if source_block.created_by_user else None,
+        lifted_by=auth_user_out(source_block.lifted_by_user) if source_block.lifted_by_user else None,
+    )
+
+
+def duplicate_link_out(link: ReportDuplicateLink, current_report_id: int) -> AdminReportDuplicateLinkOut:
+    related = link.related_report if link.report_id == current_report_id else link.report
+    return AdminReportDuplicateLinkOut(
+        id=link.id,
+        report_id=link.report_id,
+        related_report_id=related.id,
+        related_tracking_code=related.tracking_code,
+        related_status=related.status,
+        status=link.status.value if hasattr(link.status, "value") else str(link.status),
+        score=link.score,
+        reason=link.reason,
+        created_at=link.created_at,
+    )
+
+
 def report_detail_out(report: Report) -> AdminReportDetailOut:
+    duplicate_links = [
+        duplicate_link_out(link, report.id)
+        for link in sorted(
+            [*report.duplicate_links, *report.related_duplicate_links],
+            key=lambda item: (item.status.value if hasattr(item.status, "value") else str(item.status), -(item.score or 0), item.id),
+        )
+    ]
     return AdminReportDetailOut(
         id=report.id,
         tracking_code=report.tracking_code,
@@ -1170,10 +1590,15 @@ def report_detail_out(report: Report) -> AdminReportDetailOut:
                 original_filename=attachment.original_filename,
                 mime_type=attachment.mime_type,
                 file_size=attachment.file_size,
+                attachment_type=attachment.attachment_type.value
+                if hasattr(attachment.attachment_type, "value")
+                else str(attachment.attachment_type),
+                is_public=attachment.is_public,
                 created_at=attachment.created_at,
             )
             for attachment in sorted(report.attachments, key=lambda item: item.id)
         ],
+        duplicate_links=duplicate_links,
         status_history=[
             AdminStatusHistoryOut(
                 id=item.id,

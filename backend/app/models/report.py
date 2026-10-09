@@ -3,13 +3,16 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Enum,
+    Float,
     ForeignKey,
     Index,
     Integer,
     String,
     Text,
+    false,
     func,
     true,
 )
@@ -26,9 +29,83 @@ class ReportStatus(str, enum.Enum):
     OUT_OF_SCOPE = "OUT_OF_SCOPE"
 
 
+class ReportPriority(str, enum.Enum):
+    LOW = "LOW"
+    NORMAL = "NORMAL"
+    HIGH = "HIGH"
+    URGENT = "URGENT"
+
+
+class AdditionalInfoRequestStatus(str, enum.Enum):
+    OPEN = "OPEN"
+    RESPONDED = "RESPONDED"
+    CLOSED = "CLOSED"
+    CANCELLED = "CANCELLED"
+
+
+class NotificationStatus(str, enum.Enum):
+    PENDING = "PENDING"
+    SENT = "SENT"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
+class AttachmentType(str, enum.Enum):
+    INITIAL = "INITIAL"
+    BEFORE = "BEFORE"
+    AFTER = "AFTER"
+    OTHER = "OTHER"
+
+
+class DuplicateLinkStatus(str, enum.Enum):
+    SUGGESTED = "SUGGESTED"
+    LINKED = "LINKED"
+    DISMISSED = "DISMISSED"
+
+
 status_enum = Enum(
     ReportStatus,
     name="report_status",
+    native_enum=False,
+    length=32,
+    validate_strings=True,
+)
+
+priority_enum = Enum(
+    ReportPriority,
+    name="report_priority",
+    native_enum=False,
+    length=32,
+    validate_strings=True,
+)
+
+additional_info_request_status_enum = Enum(
+    AdditionalInfoRequestStatus,
+    name="additional_info_request_status",
+    native_enum=False,
+    length=32,
+    validate_strings=True,
+)
+
+notification_status_enum = Enum(
+    NotificationStatus,
+    name="notification_status",
+    native_enum=False,
+    length=32,
+    validate_strings=True,
+)
+
+attachment_type_enum = Enum(
+    AttachmentType,
+    name="attachment_type",
+    native_enum=False,
+    length=32,
+    validate_strings=True,
+)
+
+duplicate_link_status_enum = Enum(
+    DuplicateLinkStatus,
+    name="duplicate_link_status",
     native_enum=False,
     length=32,
     validate_strings=True,
@@ -48,6 +125,26 @@ class User(Base):
 
     status_changes: Mapped[list["StatusHistory"]] = relationship(back_populates="changed_by_user")
     audit_logs: Mapped[list["AuditLog"]] = relationship(back_populates="user")
+    source_blocks_created: Mapped[list["ReportSourceBlock"]] = relationship(
+        back_populates="created_by_user",
+        foreign_keys="ReportSourceBlock.created_by",
+    )
+    source_blocks_lifted: Mapped[list["ReportSourceBlock"]] = relationship(
+        back_populates="lifted_by_user",
+        foreign_keys="ReportSourceBlock.lifted_by",
+    )
+    assigned_reports: Mapped[list["Report"]] = relationship(back_populates="assigned_to_user")
+    assignment_changes: Mapped[list["ReportAssignmentHistory"]] = relationship(
+        back_populates="changed_by_user",
+        foreign_keys="ReportAssignmentHistory.changed_by",
+    )
+    internal_notes: Mapped[list["ReportInternalNote"]] = relationship(back_populates="author_user")
+    additional_info_requests: Mapped[list["AdditionalInfoRequest"]] = relationship(back_populates="requested_by_user")
+    notifications: Mapped[list["Notification"]] = relationship(back_populates="recipient_user")
+    duplicate_links_created: Mapped[list["ReportDuplicateLink"]] = relationship(
+        back_populates="created_by_user",
+        foreign_keys="ReportDuplicateLink.created_by",
+    )
 
 
 class Category(Base):
@@ -88,8 +185,50 @@ class Report(Base):
         server_default=ReportStatus.NEW.value,
         index=True,
     )
+    priority: Mapped[ReportPriority] = mapped_column(
+        priority_enum,
+        nullable=False,
+        default=ReportPriority.NORMAL,
+        server_default=ReportPriority.NORMAL.value,
+        index=True,
+    )
+    assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     public_response: Mapped[str | None] = mapped_column(Text, nullable=True)
     internal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    location_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    location_latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    location_longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
+    location_accuracy_meters: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    is_duplicate: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false(), index=True)
+    duplicate_of_report_id: Mapped[int | None] = mapped_column(
+        ForeignKey("reports.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    is_spam: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false(), index=True)
+    spam_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spam_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    moderation_status: Mapped[str] = mapped_column(
+        String(40),
+        nullable=False,
+        default="UNREVIEWED",
+        server_default="UNREVIEWED",
+        index=True,
+    )
+    reporter_ip_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    reporter_user_agent_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    request_fingerprint_hash: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    submission_source: Mapped[str] = mapped_column(
+        String(60),
+        nullable=False,
+        default="public_form",
+        server_default="public_form",
+        index=True,
+    )
+    client_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    technical_metadata: Mapped[str | None] = mapped_column("technical_metadata", Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -100,12 +239,31 @@ class Report(Base):
 
     category: Mapped[Category] = relationship(back_populates="reports")
     area: Mapped[Area | None] = relationship(back_populates="reports")
+    assigned_to_user: Mapped[User | None] = relationship(back_populates="assigned_reports", foreign_keys=[assigned_to])
+    duplicate_of_report: Mapped["Report | None"] = relationship(remote_side=[id], foreign_keys=[duplicate_of_report_id])
     attachments: Mapped[list["Attachment"]] = relationship(back_populates="report", cascade="all, delete-orphan")
     status_history: Mapped[list["StatusHistory"]] = relationship(back_populates="report", cascade="all, delete-orphan")
+    assignment_history: Mapped[list["ReportAssignmentHistory"]] = relationship(back_populates="report", cascade="all, delete-orphan")
+    internal_notes: Mapped[list["ReportInternalNote"]] = relationship(back_populates="report", cascade="all, delete-orphan")
+    additional_info_requests: Mapped[list["AdditionalInfoRequest"]] = relationship(back_populates="report", cascade="all, delete-orphan")
+    notifications: Mapped[list["Notification"]] = relationship(back_populates="report", cascade="all, delete-orphan")
+    duplicate_links: Mapped[list["ReportDuplicateLink"]] = relationship(
+        back_populates="report",
+        cascade="all, delete-orphan",
+        foreign_keys="ReportDuplicateLink.report_id",
+    )
+    related_duplicate_links: Mapped[list["ReportDuplicateLink"]] = relationship(
+        back_populates="related_report",
+        cascade="all, delete-orphan",
+        foreign_keys="ReportDuplicateLink.related_report_id",
+    )
 
     __table_args__ = (
         Index("ix_reports_status_created_at", "status", "created_at"),
         Index("ix_reports_category_status", "category_id", "status"),
+        Index("ix_reports_priority_deadline", "priority", "deadline_at"),
+        Index("ix_reports_assigned_status", "assigned_to", "status"),
+        Index("ix_reports_spam_duplicate", "is_spam", "is_duplicate"),
     )
 
 
@@ -118,9 +276,53 @@ class Attachment(Base):
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(120), nullable=False)
     file_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    attachment_type: Mapped[AttachmentType] = mapped_column(
+        attachment_type_enum,
+        nullable=False,
+        default=AttachmentType.INITIAL,
+        server_default=AttachmentType.INITIAL.value,
+        index=True,
+    )
+    is_public: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false(), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
 
     report: Mapped[Report] = relationship(back_populates="attachments")
+
+    __table_args__ = (
+        CheckConstraint("attachment_type IN ('INITIAL', 'BEFORE', 'AFTER', 'OTHER')", name="ck_attachments_attachment_type"),
+        Index("ix_attachments_report_type", "report_id", "attachment_type"),
+    )
+
+
+class ReportDuplicateLink(Base):
+    __tablename__ = "report_duplicate_links"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
+    related_report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
+    status: Mapped[DuplicateLinkStatus] = mapped_column(
+        duplicate_link_status_enum,
+        nullable=False,
+        default=DuplicateLinkStatus.SUGGESTED,
+        server_default=DuplicateLinkStatus.SUGGESTED.value,
+        index=True,
+    )
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    report: Mapped[Report] = relationship(back_populates="duplicate_links", foreign_keys=[report_id])
+    related_report: Mapped[Report] = relationship(back_populates="related_duplicate_links", foreign_keys=[related_report_id])
+    created_by_user: Mapped[User | None] = relationship(back_populates="duplicate_links_created", foreign_keys=[created_by])
+
+    __table_args__ = (
+        CheckConstraint("status IN ('SUGGESTED', 'LINKED', 'DISMISSED')", name="ck_report_duplicate_links_status"),
+        CheckConstraint("report_id <> related_report_id", name="ck_report_duplicate_links_not_self"),
+        Index("ix_report_duplicate_links_pair", "report_id", "related_report_id", unique=True),
+        Index("ix_report_duplicate_links_status_score", "status", "score"),
+    )
 
 
 class StatusHistory(Base):
@@ -143,6 +345,112 @@ class StatusHistory(Base):
     )
 
 
+class ReportAssignmentHistory(Base):
+    __tablename__ = "report_assignment_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
+    old_assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    new_assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    old_priority: Mapped[ReportPriority | None] = mapped_column(priority_enum, nullable=True)
+    new_priority: Mapped[ReportPriority | None] = mapped_column(priority_enum, nullable=True)
+    old_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    new_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    changed_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+
+    report: Mapped[Report] = relationship(back_populates="assignment_history")
+    old_assigned_to_user: Mapped[User | None] = relationship(foreign_keys=[old_assigned_to])
+    new_assigned_to_user: Mapped[User | None] = relationship(foreign_keys=[new_assigned_to])
+    changed_by_user: Mapped[User | None] = relationship(back_populates="assignment_changes", foreign_keys=[changed_by])
+
+    __table_args__ = (
+        Index("ix_report_assignment_history_report_created_at", "report_id", "created_at"),
+    )
+
+
+class ReportInternalNote(Base):
+    __tablename__ = "report_internal_notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
+    author_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    note: Mapped[str] = mapped_column(Text, nullable=False)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default=false(), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    report: Mapped[Report] = relationship(back_populates="internal_notes")
+    author_user: Mapped[User | None] = relationship(back_populates="internal_notes")
+
+    __table_args__ = (
+        Index("ix_report_internal_notes_report_created_at", "report_id", "created_at"),
+    )
+
+
+class AdditionalInfoRequest(Base):
+    __tablename__ = "additional_info_requests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
+    requested_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    status: Mapped[AdditionalInfoRequestStatus] = mapped_column(
+        additional_info_request_status_enum,
+        nullable=False,
+        default=AdditionalInfoRequestStatus.OPEN,
+        server_default=AdditionalInfoRequestStatus.OPEN.value,
+        index=True,
+    )
+    public_message: Mapped[str] = mapped_column(Text, nullable=False)
+    internal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    report: Mapped[Report] = relationship(back_populates="additional_info_requests")
+    requested_by_user: Mapped[User | None] = relationship(back_populates="additional_info_requests")
+
+    __table_args__ = (
+        Index("ix_additional_info_requests_report_status", "report_id", "status"),
+        Index("ix_additional_info_requests_status_due", "status", "due_at"),
+    )
+
+
+class Notification(Base):
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    report_id: Mapped[int | None] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=True, index=True)
+    recipient_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    channel: Mapped[str] = mapped_column(String(40), nullable=False, default="IN_APP", server_default="IN_APP", index=True)
+    notification_type: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    subject: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[NotificationStatus] = mapped_column(
+        notification_status_enum,
+        nullable=False,
+        default=NotificationStatus.PENDING,
+        server_default=NotificationStatus.PENDING.value,
+        index=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    report: Mapped[Report | None] = relationship(back_populates="notifications")
+    recipient_user: Mapped[User | None] = relationship(back_populates="notifications")
+
+    __table_args__ = (
+        Index("ix_notifications_status_scheduled", "status", "scheduled_at"),
+        Index("ix_notifications_recipient_status", "recipient_user_id", "status"),
+    )
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 
@@ -152,10 +460,42 @@ class AuditLog(Base):
     entity_type: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
     entity_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    request_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    actor_ip_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    actor_user_agent_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
 
     user: Mapped[User | None] = relationship(back_populates="audit_logs")
 
     __table_args__ = (
         Index("ix_audit_logs_entity", "entity_type", "entity_id"),
+    )
+
+
+class ReportSourceBlock(Base):
+    __tablename__ = "report_source_blocks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_type: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
+    source_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true(), index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    lifted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    lifted_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now())
+
+    created_by_user: Mapped[User | None] = relationship(
+        back_populates="source_blocks_created",
+        foreign_keys=[created_by],
+    )
+    lifted_by_user: Mapped[User | None] = relationship(
+        back_populates="source_blocks_lifted",
+        foreign_keys=[lifted_by],
+    )
+
+    __table_args__ = (
+        Index("ix_report_source_blocks_source_active", "source_type", "source_hash", "is_active"),
     )

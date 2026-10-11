@@ -773,7 +773,7 @@ async def upload_report_processing_attachments(
                     mime_type=mime_type,
                     file_size=len(content),
                     attachment_type=parsed_type,
-                    is_public=False,
+                    is_public=parsed_type == AttachmentType.AFTER,
                 )
             )
         db.add(

@@ -5,6 +5,7 @@ import re
 import secrets
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
@@ -25,6 +26,7 @@ from app.models import (
     ReportStatus,
 )
 from app.schemas.public import (
+    PublicAttachmentOut,
     PublicAreaOut,
     PublicCategoryOut,
     PublicReportCreatedOut,
@@ -196,6 +198,7 @@ def lookup_public_report(
             selectinload(Report.category),
             selectinload(Report.area),
             selectinload(Report.status_history),
+            selectinload(Report.attachments),
         )
         .where(Report.tracking_code == cleaned_tracking_code)
     )
@@ -214,7 +217,62 @@ def lookup_public_report(
         public_status=public_status_out(report.status),
         public_response=report.public_response,
         public_status_history=build_public_status_history(report),
+        public_attachments=public_attachments_out(report),
     )
+
+
+@router.get("/reports/{tracking_code}/attachments/{attachment_id}")
+def get_public_report_attachment(
+    tracking_code: str,
+    attachment_id: int,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    cleaned_tracking_code = tracking_code.strip().upper()
+    if not TRACKING_CODE_PATTERN.fullmatch(cleaned_tracking_code):
+        raise HTTPException(status_code=422, detail="Ma tra cuu khong hop le.")
+
+    attachment = db.scalar(
+        select(Attachment)
+        .join(Report, Attachment.report_id == Report.id)
+        .where(
+            Report.tracking_code == cleaned_tracking_code,
+            Attachment.id == attachment_id,
+            Attachment.is_public.is_(True),
+            Attachment.attachment_type == AttachmentType.AFTER,
+        )
+    )
+    if attachment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Khong tim thay anh cong khai.")
+
+    upload_root = Path(settings.upload_dir).resolve()
+    path = (upload_root / attachment.stored_filename).resolve()
+    if upload_root != path and upload_root not in path.parents:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File anh khong hop le.")
+    if not path.is_file():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File anh khong con ton tai.")
+
+    return FileResponse(path, media_type=attachment.mime_type, filename=attachment.original_filename)
+
+
+def public_attachments_out(report: Report) -> list[PublicAttachmentOut]:
+    attachments = [
+        attachment
+        for attachment in report.attachments
+        if attachment.is_public and attachment.attachment_type == AttachmentType.AFTER
+    ]
+    return [
+        PublicAttachmentOut(
+            id=attachment.id,
+            original_filename=attachment.original_filename,
+            mime_type=attachment.mime_type,
+            attachment_type=attachment.attachment_type.value
+            if hasattr(attachment.attachment_type, "value")
+            else str(attachment.attachment_type),
+            created_at=attachment.created_at,
+            url=f"/api/public/reports/{report.tracking_code}/attachments/{attachment.id}",
+        )
+        for attachment in sorted(attachments, key=lambda item: item.id)
+    ]
 
 
 def public_status_out(status_value: ReportStatus) -> PublicReportStatusOut:

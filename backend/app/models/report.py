@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     false,
@@ -170,6 +171,15 @@ class Area(Base):
     reports: Mapped[list["Report"]] = relationship(back_populates="area")
 
 
+class Department(Base):
+    __tablename__ = "departments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true(), index=True)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0", index=True)
+
+
 class Report(Base):
     __tablename__ = "reports"
 
@@ -193,6 +203,8 @@ class Report(Base):
         index=True,
     )
     assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    assigned_department: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    assignment_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     public_response: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -276,6 +288,7 @@ class Attachment(Base):
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(120), nullable=False)
     file_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    file_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     attachment_type: Mapped[AttachmentType] = mapped_column(
         attachment_type_enum,
         nullable=False,
@@ -352,6 +365,8 @@ class ReportAssignmentHistory(Base):
     report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
     old_assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     new_assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    old_assigned_department: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    new_assigned_department: Mapped[str | None] = mapped_column(String(160), nullable=True)
     old_priority: Mapped[ReportPriority | None] = mapped_column(priority_enum, nullable=True)
     new_priority: Mapped[ReportPriority | None] = mapped_column(priority_enum, nullable=True)
     old_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

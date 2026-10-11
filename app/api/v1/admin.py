@@ -8,7 +8,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload, selectinload
 
@@ -25,9 +25,12 @@ from app.models import (
     AttachmentType,
     AuditLog,
     Category,
+    Department,
     DuplicateLinkStatus,
     Report,
+    ReportAssignmentHistory,
     ReportDuplicateLink,
+    ReportPriority,
     ReportSourceBlock,
     ReportStatus,
     StatusHistory,
@@ -36,14 +39,18 @@ from app.models import (
 from app.schemas.admin import (
     AdminAreaIn,
     AdminAreaOut,
+    AdminAssignmentHistoryOut,
     AdminAttachmentOut,
     AdminAuditLogListOut,
     AdminAuditLogOut,
     AdminCategoryIn,
     AdminCategoryOut,
     AdminDashboardOut,
+    AdminDepartmentIn,
+    AdminDepartmentOut,
     AdminMetricOut,
     AdminQrOut,
+    AdminReportAssignmentIn,
     AdminReportDetailOut,
     AdminReportDuplicateLinkIn,
     AdminReportDuplicateLinkOut,
@@ -130,6 +137,30 @@ def download_admin_qr(
             "Cache-Control": "no-store",
         },
     )
+
+
+@router.get("/staff", response_model=list[AdminUserOut])
+def list_assignable_staff(
+    user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
+    db: Session = Depends(get_db),
+) -> list[AdminUserOut]:
+    _ = user
+    staff = db.scalars(
+        select(User)
+        .where(User.is_active.is_(True), User.role.in_(sorted(ADMIN_ROLES)))
+        .order_by(User.full_name.asc(), User.username.asc(), User.id.asc())
+    ).all()
+    return [admin_user_out(item) for item in staff]
+
+
+@router.get("/departments", response_model=list[AdminDepartmentOut])
+def list_admin_departments(
+    user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
+    db: Session = Depends(get_db),
+) -> list[AdminDepartmentOut]:
+    _ = user
+    departments = db.scalars(select(Department).order_by(Department.display_order, Department.id)).all()
+    return [department_out(db, department) for department in departments]
 
 
 @router.get("/statistics", response_model=AdminStatisticsOut)
@@ -220,19 +251,25 @@ def list_reports(
     db: Session = Depends(get_db),
     tracking_code: str | None = Query(default=None, max_length=40),
     status: ReportStatus | None = None,
+    priority: ReportPriority | None = None,
+    assigned_to: int | None = Query(default=None, ge=1),
+    assigned_department: str | None = Query(default=None, max_length=160),
     category_id: int | None = Query(default=None, ge=1),
     area_id: int | None = Query(default=None, ge=1),
     from_date: date | None = None,
     to_date: date | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
-    sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at|tracking_code|status)$"),
+    sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at|tracking_code|status|priority|assigned_at)$"),
     sort_order: str = Query(default="desc", pattern="^(asc|desc)$"),
 ) -> AdminReportListOut:
     _ = user
     filters = build_report_filters(
         tracking_code=tracking_code,
         status=status,
+        priority=priority,
+        assigned_to=assigned_to,
+        assigned_department=assigned_department,
         category_id=category_id,
         area_id=area_id,
         from_date=from_date,
@@ -248,7 +285,7 @@ def list_reports(
     order_by = sort_column.asc() if sort_order == "asc" else sort_column.desc()
     statement = (
         select(Report)
-        .options(joinedload(Report.category), joinedload(Report.area))
+        .options(joinedload(Report.category), joinedload(Report.area), joinedload(Report.assigned_to_user))
         .order_by(order_by, Report.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
@@ -257,20 +294,40 @@ def list_reports(
         statement = statement.where(*filters)
 
     reports = db.scalars(statement).all()
-    items = [
-        AdminReportListItemOut(
-            id=report.id,
-            tracking_code=report.tracking_code,
-            created_at=report.created_at,
-            updated_at=report.updated_at,
-            category=report.category.name,
-            area=report.area.name if report.area else None,
-            status=report.status,
-        )
-        for report in reports
-    ]
+    items = [admin_report_list_item_out(report) for report in reports]
     total_pages = max(1, (total + page_size - 1) // page_size)
     return AdminReportListOut(items=items, total=total, page=page, page_size=page_size, total_pages=total_pages)
+
+
+@router.get("/reports/my-work", response_model=AdminReportListOut)
+def list_my_work(
+    user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
+    db: Session = Depends(get_db),
+    status: ReportStatus | None = None,
+    priority: ReportPriority | None = None,
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=10, ge=1, le=100),
+) -> AdminReportListOut:
+    filters = build_report_filters(status=status, priority=priority, assigned_to=user.id)
+
+    total = db.scalar(select(func.count()).select_from(Report).where(*filters)) or 0
+    statement = (
+        select(Report)
+        .options(joinedload(Report.category), joinedload(Report.area), joinedload(Report.assigned_to_user))
+        .where(*filters)
+        .order_by(Report.priority.desc(), Report.updated_at.desc(), Report.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    reports = db.scalars(statement).all()
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    return AdminReportListOut(
+        items=[admin_report_list_item_out(report) for report in reports],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/reports/{report_id}", response_model=AdminReportDetailOut)
@@ -281,6 +338,94 @@ def get_report_detail(
 ) -> AdminReportDetailOut:
     _ = user
     return report_detail_out(load_report_or_404(db, report_id))
+
+
+@router.post("/reports/{report_id}/assignment", response_model=AdminReportDetailOut)
+def assign_report(
+    report_id: int,
+    payload: AdminReportAssignmentIn,
+    user: User = Depends(require_roles("ADMIN", "RECEIVER")),
+    db: Session = Depends(get_db),
+) -> AdminReportDetailOut:
+    report = load_report_or_404(db, report_id)
+    if report.assignment_version != payload.expected_assignment_version:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Phan cong da duoc cap nhat boi nguoi khac. Vui long tai lai du lieu truoc khi luu.",
+        )
+    new_assigned_to_user = load_assignable_user(db, payload.assigned_to) if payload.assigned_to else None
+    new_department = clean_text(payload.assigned_department)
+    if new_assigned_to_user is None and not new_department:
+        raise HTTPException(status_code=422, detail="Vui long chon can bo hoac bo phan xu ly.")
+
+    old_assigned_to = report.assigned_to
+    old_department = report.assigned_department
+    old_priority = report.priority
+    old_deadline_at = report.deadline_at
+    reason = require_assignment_reason(payload.reason)
+
+    new_assigned_to = new_assigned_to_user.id if new_assigned_to_user else None
+    new_assigned_at = datetime.now(timezone.utc)
+    new_assignment_version = payload.expected_assignment_version + 1
+    result = db.execute(
+        update(Report)
+        .where(
+            Report.id == report.id,
+            Report.assignment_version == payload.expected_assignment_version,
+        )
+        .values(
+            assigned_to=new_assigned_to,
+            assigned_department=new_department,
+            priority=payload.priority,
+            deadline_at=payload.deadline_at,
+            assigned_at=new_assigned_at,
+            assignment_version=new_assignment_version,
+        )
+    )
+    if result.rowcount != 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Phan cong da duoc cap nhat boi nguoi khac. Vui long tai lai du lieu truoc khi luu.",
+        )
+    db.add(
+        ReportAssignmentHistory(
+            report_id=report.id,
+            old_assigned_to=old_assigned_to,
+            new_assigned_to=new_assigned_to,
+            old_assigned_department=old_department,
+            new_assigned_department=new_department,
+            old_priority=old_priority,
+            new_priority=payload.priority,
+            old_deadline_at=old_deadline_at,
+            new_deadline_at=payload.deadline_at,
+            reason=reason,
+            changed_by=user.id,
+        )
+    )
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="REPORT_ASSIGNMENT_CHANGE",
+            entity_type="report",
+            entity_id=report.id,
+            details=json.dumps(
+                {
+                    "tracking_code": report.tracking_code,
+                    "old_assigned_to": old_assigned_to,
+                    "new_assigned_to": new_assigned_to,
+                    "old_assigned_department": old_department,
+                    "new_assigned_department": new_department,
+                    "old_priority": old_priority.value if hasattr(old_priority, "value") else str(old_priority),
+                    "new_priority": payload.priority.value,
+                    "assignment_version": new_assignment_version,
+                    "has_reason": True,
+                },
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    return report_detail_out(load_report_or_404(db, report.id))
 
 
 @router.get("/reports/{report_id}/technical", response_model=AdminReportTechnicalOut)
@@ -602,6 +747,71 @@ def update_admin_area(
     return area_out(db, area)
 
 
+@router.post("/departments", response_model=AdminDepartmentOut, status_code=status.HTTP_201_CREATED)
+def create_admin_department(
+    payload: AdminDepartmentIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminDepartmentOut:
+    name = require_clean_name(payload.name, "Ten bo phan xu ly la bat buoc.")
+    department = Department(name=name, is_active=payload.is_active, display_order=payload.display_order)
+    try:
+        db.add(department)
+        db.flush()
+        add_catalog_audit_log(
+            db,
+            user=user,
+            action="DEPARTMENT_CREATE",
+            entity_type="department",
+            entity_id=department.id,
+            before=None,
+            after=catalog_snapshot(department),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ten bo phan xu ly da ton tai.") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return department_out(db, department)
+
+
+@router.put("/departments/{department_id}", response_model=AdminDepartmentOut)
+def update_admin_department(
+    department_id: int,
+    payload: AdminDepartmentIn,
+    user: User = Depends(require_roles("ADMIN")),
+    db: Session = Depends(get_db),
+) -> AdminDepartmentOut:
+    department = load_department_or_404(db, department_id)
+    before = catalog_snapshot(department)
+    department.name = require_clean_name(payload.name, "Ten bo phan xu ly la bat buoc.")
+    department.is_active = payload.is_active
+    department.display_order = payload.display_order
+    try:
+        db.flush()
+        add_catalog_audit_log(
+            db,
+            user=user,
+            action="DEPARTMENT_UPDATE",
+            entity_type="department",
+            entity_id=department.id,
+            before=before,
+            after=catalog_snapshot(department),
+        )
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Ten bo phan xu ly da ton tai.") from exc
+    except Exception:
+        db.rollback()
+        raise
+
+    return department_out(db, department)
+
+
 @router.get("/users", response_model=list[AdminUserOut])
 def list_admin_users(
     user: User = Depends(require_roles("ADMIN")),
@@ -736,6 +946,8 @@ def get_report_attachment(
     if upload_root != path and upload_root not in path.parents:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File áº£nh khÃ´ng há»£p lá»‡.")
     if not path.is_file():
+        if attachment.file_data:
+            return Response(content=attachment.file_data, media_type=attachment.mime_type)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File áº£nh khÃ´ng cÃ²n tá»“n táº¡i.")
 
     return FileResponse(path, media_type=attachment.mime_type, filename=attachment.original_filename)
@@ -772,8 +984,9 @@ async def upload_report_processing_attachments(
                     original_filename=original_filename,
                     mime_type=mime_type,
                     file_size=len(content),
+                    file_data=content,
                     attachment_type=parsed_type,
-                    is_public=False,
+                    is_public=parsed_type == AttachmentType.AFTER,
                 )
             )
         db.add(
@@ -955,6 +1168,9 @@ def build_report_filters(
     *,
     tracking_code: str | None = None,
     status: ReportStatus | None = None,
+    priority: ReportPriority | None = None,
+    assigned_to: int | None = None,
+    assigned_department: str | None = None,
     category_id: int | None = None,
     area_id: int | None = None,
     from_date: date | None = None,
@@ -965,6 +1181,12 @@ def build_report_filters(
         filters.append(Report.tracking_code.ilike(f"%{tracking_code.strip().upper()}%"))
     if status:
         filters.append(Report.status == status)
+    if priority:
+        filters.append(Report.priority == priority)
+    if assigned_to:
+        filters.append(Report.assigned_to == assigned_to)
+    if assigned_department:
+        filters.append(Report.assigned_department.ilike(f"%{assigned_department.strip()}%"))
     if category_id:
         filters.append(Report.category_id == category_id)
     if area_id:
@@ -1154,6 +1376,13 @@ def load_area_or_404(db: Session, area_id: int) -> Area:
     return area
 
 
+def load_department_or_404(db: Session, department_id: int) -> Department:
+    department = db.get(Department, department_id)
+    if department is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Khong tim thay bo phan xu ly.")
+    return department
+
+
 def category_out(db: Session, category: Category) -> AdminCategoryOut:
     report_count = db.scalar(select(func.count()).select_from(Report).where(Report.category_id == category.id)) or 0
     return AdminCategoryOut(
@@ -1177,10 +1406,30 @@ def area_out(db: Session, area: Area) -> AdminAreaOut:
     )
 
 
+def department_out(db: Session, department: Department) -> AdminDepartmentOut:
+    report_count = db.scalar(
+        select(func.count()).select_from(Report).where(Report.assigned_department == department.name)
+    ) or 0
+    return AdminDepartmentOut(
+        id=department.id,
+        name=department.name,
+        is_active=department.is_active,
+        display_order=department.display_order,
+        report_count=report_count,
+    )
+
+
 def load_user_or_404(db: Session, user_id: int) -> User:
     target = db.get(User, user_id)
     if target is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Không tìm thấy tài khoản cán bộ.")
+    return target
+
+
+def load_assignable_user(db: Session, user_id: int) -> User:
+    target = load_user_or_404(db, user_id)
+    if not target.is_active or target.role not in ADMIN_ROLES:
+        raise HTTPException(status_code=422, detail="Can bo duoc giao khong hop le hoac da bi khoa.")
     return target
 
 
@@ -1192,6 +1441,23 @@ def admin_user_out(user: User) -> AdminUserOut:
         role=user.role,
         is_active=user.is_active,
         created_at=user.created_at,
+    )
+
+
+def admin_report_list_item_out(report: Report) -> AdminReportListItemOut:
+    return AdminReportListItemOut(
+        id=report.id,
+        tracking_code=report.tracking_code,
+        created_at=report.created_at,
+        updated_at=report.updated_at,
+        category=report.category.name,
+        area=report.area.name if report.area else None,
+        status=report.status,
+        priority=report.priority,
+        assigned_to=auth_user_out(report.assigned_to_user) if report.assigned_to_user else None,
+        assigned_department=report.assigned_department,
+        assignment_version=report.assignment_version,
+        assigned_at=report.assigned_at,
     )
 
 
@@ -1295,10 +1561,14 @@ def load_report_or_404(db: Session, report_id: int) -> Report:
         .options(
             selectinload(Report.category),
             selectinload(Report.area),
+            selectinload(Report.assigned_to_user),
             selectinload(Report.attachments),
             selectinload(Report.duplicate_links).selectinload(ReportDuplicateLink.related_report),
             selectinload(Report.related_duplicate_links).selectinload(ReportDuplicateLink.report),
             selectinload(Report.status_history).selectinload(StatusHistory.changed_by_user),
+            selectinload(Report.assignment_history).selectinload(ReportAssignmentHistory.old_assigned_to_user),
+            selectinload(Report.assignment_history).selectinload(ReportAssignmentHistory.new_assigned_to_user),
+            selectinload(Report.assignment_history).selectinload(ReportAssignmentHistory.changed_by_user),
         )
         .where(Report.id == report_id)
     )
@@ -1434,7 +1704,7 @@ def add_user_audit_log(
     )
 
 
-def catalog_snapshot(item: Category | Area) -> dict[str, object]:
+def catalog_snapshot(item: Category | Area | Department) -> dict[str, object]:
     snapshot: dict[str, object] = {
         "id": item.id,
         "name": item.name,
@@ -1460,6 +1730,13 @@ def require_clean_name(value: str, message: str) -> str:
     cleaned = value.strip()
     if not cleaned:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=message)
+    return cleaned
+
+
+def require_assignment_reason(value: str) -> str:
+    cleaned = clean_text(value)
+    if not cleaned:
+        raise HTTPException(status_code=422, detail="Vui long nhap ly do phan cong/chuyen xu ly.")
     return cleaned
 
 
@@ -1565,6 +1842,23 @@ def duplicate_link_out(link: ReportDuplicateLink, current_report_id: int) -> Adm
     )
 
 
+def assignment_history_out(item: ReportAssignmentHistory) -> AdminAssignmentHistoryOut:
+    return AdminAssignmentHistoryOut(
+        id=item.id,
+        old_assigned_to=auth_user_out(item.old_assigned_to_user) if item.old_assigned_to_user else None,
+        new_assigned_to=auth_user_out(item.new_assigned_to_user) if item.new_assigned_to_user else None,
+        old_assigned_department=item.old_assigned_department,
+        new_assigned_department=item.new_assigned_department,
+        old_priority=item.old_priority,
+        new_priority=item.new_priority,
+        old_deadline_at=item.old_deadline_at,
+        new_deadline_at=item.new_deadline_at,
+        reason=item.reason,
+        changed_by=auth_user_out(item.changed_by_user) if item.changed_by_user else None,
+        created_at=item.created_at,
+    )
+
+
 def report_detail_out(report: Report) -> AdminReportDetailOut:
     duplicate_links = [
         duplicate_link_out(link, report.id)
@@ -1582,6 +1876,12 @@ def report_detail_out(report: Report) -> AdminReportDetailOut:
         area=report.area.name if report.area else None,
         description=report.description,
         status=report.status,
+        priority=report.priority,
+        assigned_to=auth_user_out(report.assigned_to_user) if report.assigned_to_user else None,
+        assigned_department=report.assigned_department,
+        assignment_version=report.assignment_version,
+        assigned_at=report.assigned_at,
+        deadline_at=report.deadline_at,
         public_response=report.public_response,
         internal_note=report.internal_note,
         attachments=[
@@ -1610,5 +1910,9 @@ def report_detail_out(report: Report) -> AdminReportDetailOut:
                 created_at=item.created_at,
             )
             for item in sorted(report.status_history, key=lambda item: (item.created_at, item.id))
+        ],
+        assignment_history=[
+            assignment_history_out(item)
+            for item in sorted(report.assignment_history, key=lambda item: (item.created_at, item.id))
         ],
     )

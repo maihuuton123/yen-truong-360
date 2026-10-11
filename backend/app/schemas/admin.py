@@ -3,7 +3,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.models import ReportStatus
+from app.models import ReportPriority, ReportStatus
 from app.schemas.auth import AuthUserOut
 
 
@@ -80,6 +80,11 @@ class AdminReportListItemOut(BaseModel):
     category: str
     area: str | None
     status: ReportStatus
+    priority: ReportPriority
+    assigned_to: AuthUserOut | None = None
+    assigned_department: str | None = None
+    assignment_version: int = 0
+    assigned_at: datetime | None = None
 
 
 class AdminReportListOut(BaseModel):
@@ -122,6 +127,21 @@ class AdminStatusHistoryOut(BaseModel):
     created_at: datetime
 
 
+class AdminAssignmentHistoryOut(BaseModel):
+    id: int
+    old_assigned_to: AuthUserOut | None
+    new_assigned_to: AuthUserOut | None
+    old_assigned_department: str | None
+    new_assigned_department: str | None
+    old_priority: ReportPriority | None
+    new_priority: ReportPriority | None
+    old_deadline_at: datetime | None
+    new_deadline_at: datetime | None
+    reason: str | None
+    changed_by: AuthUserOut | None
+    created_at: datetime
+
+
 class AdminReportDetailOut(BaseModel):
     id: int
     tracking_code: str
@@ -131,11 +151,18 @@ class AdminReportDetailOut(BaseModel):
     area: str | None
     description: str
     status: ReportStatus
+    priority: ReportPriority
+    assigned_to: AuthUserOut | None = None
+    assigned_department: str | None = None
+    assignment_version: int = 0
+    assigned_at: datetime | None = None
+    deadline_at: datetime | None = None
     public_response: str | None
     internal_note: str | None
     attachments: list[AdminAttachmentOut]
     duplicate_links: list[AdminReportDuplicateLinkOut] = Field(default_factory=list)
     status_history: list[AdminStatusHistoryOut]
+    assignment_history: list[AdminAssignmentHistoryOut] = Field(default_factory=list)
 
 
 class AdminReportTechnicalOut(BaseModel):
@@ -174,6 +201,15 @@ class AdminReportTransitionIn(BaseModel):
     coordination_target: str | None = Field(default=None, max_length=300)
 
 
+class AdminReportAssignmentIn(BaseModel):
+    assigned_to: int | None = Field(default=None, ge=1)
+    assigned_department: str | None = Field(default=None, max_length=160)
+    priority: ReportPriority = ReportPriority.NORMAL
+    deadline_at: datetime | None = None
+    reason: str = Field(min_length=1, max_length=1000)
+    expected_assignment_version: int = Field(ge=0)
+
+
 class AdminReportDuplicateLinkIn(BaseModel):
     related_report_id: int = Field(ge=1)
     reason: str | None = Field(default=None, max_length=500)
@@ -202,6 +238,20 @@ class AdminAreaIn(BaseModel):
 
 
 class AdminAreaOut(BaseModel):
+    id: int
+    name: str
+    is_active: bool
+    display_order: int
+    report_count: int
+
+
+class AdminDepartmentIn(BaseModel):
+    name: str = Field(min_length=1, max_length=160)
+    is_active: bool = True
+    display_order: int = Field(default=0, ge=0, le=100000)
+
+
+class AdminDepartmentOut(BaseModel):
     id: int
     name: str
     is_active: bool

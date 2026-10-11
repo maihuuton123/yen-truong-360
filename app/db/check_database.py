@@ -1,13 +1,14 @@
 from sqlalchemy import func, inspect, select
 
 from app.db.session import engine, SessionLocal
-from app.models import Area, Category, User
+from app.models import Area, Category, Department, User
 
 
 EXPECTED_TABLES = {
     "users",
     "categories",
     "areas",
+    "departments",
     "reports",
     "attachments",
     "status_history",
@@ -52,11 +53,13 @@ def check_database() -> None:
     with SessionLocal() as db:
         category_count = db.scalar(select(func.count()).select_from(Category))
         area_count = db.scalar(select(func.count()).select_from(Area))
+        department_count = db.scalar(select(func.count()).select_from(Department))
         admin_count = db.scalar(select(func.count()).select_from(User).where(User.role == "ADMIN"))
 
     print(f"Tables OK: {', '.join(sorted(EXPECTED_TABLES))}")
     print(f"Categories: {category_count}")
     print(f"Areas: {area_count}")
+    print(f"Departments: {department_count}")
     print(f"Admin users: {admin_count}")
 
 

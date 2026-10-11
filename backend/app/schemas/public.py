@@ -40,6 +40,15 @@ class PublicReportStatusHistoryOut(BaseModel):
     created_at: datetime
 
 
+class PublicAttachmentOut(BaseModel):
+    id: int
+    original_filename: str
+    mime_type: str
+    attachment_type: str
+    created_at: datetime
+    url: str
+
+
 class PublicReportLookupOut(BaseModel):
     tracking_code: str
     category: str
@@ -49,3 +58,4 @@ class PublicReportLookupOut(BaseModel):
     public_status: PublicReportStatusOut
     public_response: str | None
     public_status_history: list[PublicReportStatusHistoryOut]
+    public_attachments: list[PublicAttachmentOut] = []

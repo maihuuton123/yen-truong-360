@@ -1,6 +1,7 @@
 import tempfile
 import unittest
-from datetime import datetime
+import json
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
@@ -11,12 +12,30 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.core import security
+from app.api.v1.admin import deadline_input_to_utc_naive, deadline_status_out
 from app.core.config import settings
 from app.core.security import hash_password
 from app.db.base import Base
 from app.db.dependencies import get_db
 from app.main import create_app
-from app.models import Area, Attachment, AuditLog, Category, Report, ReportStatus, StatusHistory, User
+from app.models import (
+    Area,
+    Attachment,
+    AuditLog,
+    Category,
+    Department,
+    DuplicateLinkStatus,
+    Report,
+    ReportAssignmentHistory,
+    ReportPriority,
+    ReportDuplicateLink,
+    ReportSourceBlock,
+    ReportStatus,
+    StatusHistory,
+    User,
+)
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 24
 
 
 class AuthApiTests(unittest.TestCase):
@@ -156,6 +175,10 @@ class AuthApiTests(unittest.TestCase):
         with self.SessionTesting() as db:
             return db.query(Report).filter(Report.tracking_code == tracking_code).one().id
 
+    def user_id(self, username):
+        with self.SessionTesting() as db:
+            return db.query(User).filter(User.username == username).one().id
+
     def test_login_success_returns_token_and_user_without_password_hash(self):
         response = self.login()
 
@@ -220,6 +243,229 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(body["work"]["new_reports"], 1)
         self.assertEqual(body["work"]["coordinating_reports"], 1)
         self.assertEqual(body["work"]["needs_update"], 2)
+        self.assertEqual(body["work"]["deadline_due_soon"], 0)
+        self.assertEqual(body["work"]["deadline_overdue"], 0)
+
+    def test_deadline_status_boundaries_and_timezone_conversion(self):
+        fixed_now = datetime(2026, 10, 12, 8, 0, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            deadline_status_out(
+                Report(
+                    tracking_code="YT360-ONTRAK",
+                    category_id=self.category_id,
+                    description="Con han.",
+                    deadline_at=fixed_now + timedelta(hours=25),
+                    status=ReportStatus.NEW,
+                ),
+                now=fixed_now,
+            ).code,
+            "ON_TRACK",
+        )
+        self.assertEqual(
+            deadline_status_out(
+                Report(
+                    tracking_code="YT360-DUESON",
+                    category_id=self.category_id,
+                    description="Dung han.",
+                    deadline_at=fixed_now,
+                    status=ReportStatus.NEW,
+                ),
+                now=fixed_now,
+            ).code,
+            "DUE_SOON",
+        )
+        self.assertEqual(
+            deadline_status_out(
+                Report(
+                    tracking_code="YT360-OVERDU",
+                    category_id=self.category_id,
+                    description="Qua han.",
+                    deadline_at=fixed_now - timedelta(seconds=1),
+                    status=ReportStatus.NEW,
+                ),
+                now=fixed_now,
+            ).code,
+            "OVERDUE",
+        )
+        self.assertEqual(
+            deadline_status_out(
+                Report(
+                    tracking_code="YT360-DONEOK",
+                    category_id=self.category_id,
+                    description="Hoan thanh dung han.",
+                    deadline_at=fixed_now,
+                    status=ReportStatus.RESOLVED,
+                    status_history=[
+                        StatusHistory(
+                            new_status=ReportStatus.RESOLVED,
+                            created_at=fixed_now,
+                        )
+                    ],
+                ),
+                now=fixed_now,
+            ).code,
+            "COMPLETED_ON_TIME",
+        )
+        self.assertEqual(
+            deadline_status_out(
+                Report(
+                    tracking_code="YT360-DONELT",
+                    category_id=self.category_id,
+                    description="Hoan thanh sau han.",
+                    deadline_at=fixed_now - timedelta(minutes=1),
+                    status=ReportStatus.RESOLVED,
+                    status_history=[
+                        StatusHistory(
+                            new_status=ReportStatus.RESOLVED,
+                            created_at=fixed_now,
+                        )
+                    ],
+                ),
+                now=fixed_now,
+            ).code,
+            "COMPLETED_LATE",
+        )
+        self.assertEqual(
+            deadline_input_to_utc_naive(datetime(2026, 10, 12, 8, 30)),
+            datetime(2026, 10, 12, 1, 30),
+        )
+
+    def test_deadline_time_windows_cover_v26_required_boundaries(self):
+        fixed_now = datetime(2026, 2, 28, 17, 0, tzinfo=timezone.utc)
+        cases = [
+            ("NO_DEADLINE", None, "NO_DEADLINE"),
+            ("SEVEN_DAYS", fixed_now + timedelta(days=7), "ON_TRACK"),
+            ("THREE_DAYS", fixed_now + timedelta(days=3), "ON_TRACK"),
+            ("TWENTY_FOUR_HOURS", fixed_now + timedelta(hours=24), "DUE_SOON"),
+            ("TWELVE_HOURS", fixed_now + timedelta(hours=12), "DUE_SOON"),
+            ("ONE_HOUR", fixed_now + timedelta(hours=1), "DUE_SOON"),
+            ("ONE_MINUTE", fixed_now + timedelta(minutes=1), "DUE_SOON"),
+            ("EXACT_DEADLINE", fixed_now, "DUE_SOON"),
+            ("OVERDUE_ONE_MINUTE", fixed_now - timedelta(minutes=1), "OVERDUE"),
+            ("OVERDUE_ONE_HOUR", fixed_now - timedelta(hours=1), "OVERDUE"),
+            ("OVERDUE_ONE_DAY", fixed_now - timedelta(days=1), "OVERDUE"),
+            ("OVERDUE_SEVEN_DAYS", fixed_now - timedelta(days=7), "OVERDUE"),
+            ("LEAP_DAY", datetime(2028, 2, 29, 0, 0, tzinfo=timezone.utc), "ON_TRACK"),
+            ("YEAR_ROLLOVER", datetime(2027, 1, 1, 0, 0, tzinfo=timezone.utc), "ON_TRACK"),
+        ]
+        for tracking_suffix, deadline_at, expected_code in cases:
+            with self.subTest(tracking_suffix=tracking_suffix):
+                status_out = deadline_status_out(
+                    Report(
+                        tracking_code=f"YT360-{tracking_suffix[:6]}",
+                        category_id=self.category_id,
+                        description="Boundary check.",
+                        deadline_at=deadline_at,
+                        status=ReportStatus.NEW,
+                    ),
+                    now=fixed_now,
+                )
+                self.assertEqual(status_out.code, expected_code)
+                if deadline_at is not None:
+                    self.assertEqual(
+                        status_out.remaining_seconds,
+                        int((deadline_at - fixed_now).total_seconds()),
+                    )
+
+    def test_dashboard_my_work_and_filters_include_deadline_management(self):
+        handler_id = self.user_id("handler")
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        with self.SessionTesting() as db:
+            db.query(Report).filter(Report.tracking_code == "YT360-AAAAAA").update(
+                {
+                    Report.assigned_to: handler_id,
+                    Report.deadline_at: (now + timedelta(hours=30)).replace(tzinfo=None),
+                }
+            )
+            db.query(Report).filter(Report.tracking_code == "YT360-BBBBBB").update(
+                {
+                    Report.assigned_to: handler_id,
+                    Report.deadline_at: (now + timedelta(hours=12)).replace(tzinfo=None),
+                }
+            )
+            db.query(Report).filter(Report.tracking_code == "YT360-DDDDDD").update(
+                {
+                    Report.assigned_to: handler_id,
+                    Report.deadline_at: (now - timedelta(hours=2)).replace(tzinfo=None),
+                }
+            )
+            db.query(Report).filter(Report.tracking_code == "YT360-CCCCCC").update(
+                {
+                    Report.assigned_to: handler_id,
+                    Report.deadline_at: (now - timedelta(days=1)).replace(tzinfo=None),
+                }
+            )
+            completed_late = db.query(Report).filter(Report.tracking_code == "YT360-CCCCCC").one()
+            db.add(
+                StatusHistory(
+                    report_id=completed_late.id,
+                    new_status=ReportStatus.RESOLVED,
+                    created_at=now.replace(tzinfo=None),
+                )
+            )
+            completed_on_time = Report(
+                tracking_code="YT360-DONEON",
+                category_id=self.category_id,
+                area_id=self.area_id,
+                description="Hoan thanh dung han.",
+                status=ReportStatus.RESOLVED,
+                assigned_to=handler_id,
+                deadline_at=(now + timedelta(hours=1)).replace(tzinfo=None),
+            )
+            db.add(completed_on_time)
+            db.flush()
+            db.add(
+                StatusHistory(
+                    report_id=completed_on_time.id,
+                    new_status=ReportStatus.RESOLVED,
+                    created_at=now.replace(tzinfo=None),
+                )
+            )
+            db.commit()
+
+        dashboard = self.client.get("/api/admin/dashboard", headers=self.auth_headers()).json()
+        self.assertEqual(dashboard["work"]["deadline_on_track"], 1)
+        self.assertEqual(dashboard["work"]["deadline_due_soon"], 1)
+        self.assertEqual(dashboard["work"]["deadline_overdue"], 1)
+        self.assertEqual(dashboard["work"]["deadline_completed"], 2)
+        self.assertEqual(dashboard["work"]["deadline_completed_on_time"], 1)
+        self.assertEqual(dashboard["work"]["deadline_completed_late"], 1)
+        self.assertEqual(dashboard["work"]["deadline_total"], 5)
+
+        due_soon = self.client.get(
+            "/api/admin/reports",
+            params={"deadline_status": "DUE_SOON", "sort_by": "deadline_at", "sort_order": "asc"},
+            headers=self.auth_headers(),
+        )
+        overdue = self.client.get(
+            "/api/admin/reports",
+            params={"deadline_status": "OVERDUE"},
+            headers=self.auth_headers(),
+        )
+        completed_late = self.client.get(
+            "/api/admin/reports",
+            params={"deadline_status": "COMPLETED_LATE"},
+            headers=self.auth_headers(),
+        )
+        my_work = self.client.get(
+            "/api/admin/reports/my-work",
+            params={"deadline_status": "DUE_SOON"},
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+
+        self.assertEqual(due_soon.status_code, 200)
+        self.assertEqual(due_soon.json()["total"], 1)
+        self.assertEqual(due_soon.json()["items"][0]["deadline_status"]["code"], "DUE_SOON")
+        self.assertEqual(overdue.status_code, 200)
+        self.assertEqual(overdue.json()["items"][0]["deadline_status"]["code"], "OVERDUE")
+        self.assertEqual(completed_late.status_code, 200)
+        self.assertEqual(completed_late.json()["total"], 1)
+        self.assertEqual(completed_late.json()["items"][0]["deadline_status"]["code"], "COMPLETED_LATE")
+        self.assertEqual(my_work.status_code, 200)
+        self.assertEqual(my_work.json()["total"], 1)
+        self.assertIsNotNone(my_work.json()["items"][0]["deadline_at"])
+        self.assertEqual(my_work.json()["items"][0]["deadline_status"]["code"], "DUE_SOON")
 
     def test_admin_qr_uses_public_site_url_and_can_download_svg(self):
         headers = self.auth_headers("admin", "admin-password")
@@ -342,6 +588,60 @@ class AuthApiTests(unittest.TestCase):
             ).status_code,
             403,
         )
+
+    def test_admin_can_manage_assignment_departments_with_audit_log(self):
+        headers = self.auth_headers("admin", "admin-password")
+
+        created = self.client.post(
+            "/api/admin/departments",
+            json={"name": "  To ha tang  ", "is_active": True, "display_order": 3},
+            headers=headers,
+        )
+
+        self.assertEqual(created.status_code, 201)
+        department_id = created.json()["id"]
+        self.assertEqual(created.json()["name"], "To ha tang")
+        self.assertEqual(created.json()["report_count"], 0)
+
+        visible_to_handler = self.client.get(
+            "/api/admin/departments",
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        self.assertEqual(visible_to_handler.status_code, 200)
+        self.assertIn(department_id, [item["id"] for item in visible_to_handler.json()])
+
+        updated = self.client.put(
+            f"/api/admin/departments/{department_id}",
+            json={"name": "To ha tang cap nuoc", "is_active": False, "display_order": 4},
+            headers=headers,
+        )
+        duplicate = self.client.post(
+            "/api/admin/departments",
+            json={"name": "To ha tang cap nuoc", "is_active": True, "display_order": 5},
+            headers=headers,
+        )
+        forbidden = self.client.post(
+            "/api/admin/departments",
+            json={"name": "Cong an xa", "is_active": True, "display_order": 6},
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+
+        self.assertEqual(updated.status_code, 200)
+        self.assertEqual(updated.json()["name"], "To ha tang cap nuoc")
+        self.assertFalse(updated.json()["is_active"])
+        self.assertEqual(duplicate.status_code, 409)
+        self.assertEqual(forbidden.status_code, 403)
+        with self.SessionTesting() as db:
+            department = db.query(Department).filter(Department.id == department_id).one()
+            actions = [
+                item.action
+                for item in db.query(AuditLog)
+                .filter(AuditLog.entity_type == "department", AuditLog.entity_id == department_id)
+                .order_by(AuditLog.id)
+                .all()
+            ]
+            self.assertEqual(department.display_order, 4)
+            self.assertEqual(actions, ["DEPARTMENT_CREATE", "DEPARTMENT_UPDATE"])
 
     def test_catalog_duplicate_names_are_rejected(self):
         headers = self.auth_headers("admin", "admin-password")
@@ -487,6 +787,39 @@ class AuthApiTests(unittest.TestCase):
             403,
         )
         self.assertEqual(self.client.get("/api/admin/users", headers=self.auth_headers()).status_code, 200)
+
+    def test_admin_can_list_audit_logs_without_sensitive_fields(self):
+        admin_headers = self.auth_headers("admin", "admin-password")
+        receiver_headers = self.auth_headers("receiver", "receiver-password")
+
+        created = self.client.post(
+            "/api/admin/categories",
+            json={"name": "Audit category", "icon": "audit", "is_active": True, "display_order": 11},
+            headers=admin_headers,
+        )
+        self.assertEqual(created.status_code, 201)
+
+        no_auth = self.client.get("/api/admin/audit-logs")
+        receiver = self.client.get("/api/admin/audit-logs", headers=receiver_headers)
+        response = self.client.get("/api/admin/audit-logs", headers=admin_headers)
+
+        self.assertEqual(no_auth.status_code, 401)
+        self.assertEqual(receiver.status_code, 403)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertGreaterEqual(body["total"], 1)
+        self.assertEqual(body["page"], 1)
+        self.assertEqual(body["page_size"], 20)
+        first = body["items"][0]
+        self.assertIn(
+            first["action"],
+            {"CATEGORY_CREATE", "AREA_CREATE", "USER_CREATE", "USER_UPDATE", "USER_PASSWORD_RESET", "REPORT_RECEIVE"},
+        )
+        self.assertIn("created_at", first)
+        self.assertIn("user", first)
+        self.assertNotIn("password_hash", response.text.lower())
+        self.assertNotIn("admin-password", response.text.lower())
+        self.assertNotIn("receiver-password", response.text.lower())
 
     def test_update_user_role_affects_new_login_and_backend_authorization(self):
         headers = self.auth_headers("admin", "admin-password")
@@ -742,7 +1075,281 @@ class AuthApiTests(unittest.TestCase):
         self.assertTrue(body["area"])
         self.assertEqual(body["status"], "NEW")
         self.assertEqual(body["attachments"][0]["original_filename"], "test-image.png")
+        self.assertEqual(body["attachments"][0]["attachment_type"], "INITIAL")
+        self.assertFalse(body["attachments"][0]["is_public"])
+        self.assertEqual(body["duplicate_links"], [])
         self.assertEqual(body["status_history"], [])
+
+    def test_admin_can_link_related_reports_without_merging_originals(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        related_report_id = self.report_id("YT360-BBBBBB")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/related-reports",
+            json={"related_report_id": related_report_id, "reason": "Same incident reported twice"},
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        no_auth_response = self.client.post(
+            f"/api/admin/reports/{report_id}/related-reports",
+            json={"related_report_id": related_report_id},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(no_auth_response.status_code, 401)
+        body = response.json()
+        self.assertEqual(body["related_report_id"], related_report_id)
+        self.assertEqual(body["related_tracking_code"], "YT360-BBBBBB")
+        self.assertEqual(body["status"], "LINKED")
+
+        detail = self.client.get(f"/api/admin/reports/{report_id}", headers=self.auth_headers())
+        self.assertEqual(detail.status_code, 200)
+        self.assertEqual(detail.json()["duplicate_links"][0]["related_tracking_code"], "YT360-BBBBBB")
+        with self.SessionTesting() as db:
+            self.assertIsNotNone(db.get(Report, report_id))
+            self.assertIsNotNone(db.get(Report, related_report_id))
+            link = db.query(ReportDuplicateLink).one()
+            self.assertEqual(link.status, DuplicateLinkStatus.LINKED)
+
+    def test_related_report_link_rejects_self_link(self):
+        report_id = self.report_id("YT360-AAAAAA")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/related-reports",
+            json={"related_report_id": report_id},
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_handler_can_upload_processing_images_but_receiver_cannot(self):
+        report_id = self.report_id("YT360-AAAAAA")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/attachments",
+            data={"attachment_type": "AFTER"},
+            files=[
+                ("images", ("after-1.png", PNG_BYTES, "image/png")),
+                ("images", ("after-2.png", PNG_BYTES, "image/png")),
+            ],
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        receiver_response = self.client.post(
+            f"/api/admin/reports/{report_id}/attachments",
+            data={"attachment_type": "AFTER"},
+            files=[("images", ("after-3.png", PNG_BYTES, "image/png"))],
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(receiver_response.status_code, 403)
+        attachments = response.json()["attachments"]
+        after_images = [item for item in attachments if item["attachment_type"] == "AFTER"]
+        self.assertEqual(len(after_images), 2)
+        self.assertTrue(all(item["is_public"] for item in after_images))
+        with self.SessionTesting() as db:
+            stored = db.query(Attachment).filter(Attachment.report_id == report_id).all()
+            self.assertEqual(len([item for item in stored if item.attachment_type.value == "AFTER"]), 2)
+
+    def test_assignment_workflow_enforces_rbac_filters_history_and_audit(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        handler = self.user_id("handler")
+
+        forbidden = self.client.post(
+            f"/api/admin/reports/{report_id}/assignment",
+            json={
+                "assigned_to": handler,
+                "assigned_department": "To xu ly nhanh",
+                "priority": "HIGH",
+                "reason": "Handler khong duoc phan cong.",
+                "expected_assignment_version": 0,
+            },
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/assignment",
+            json={
+                "assigned_to": handler,
+                "assigned_department": "To xu ly nhanh",
+                "priority": "URGENT",
+                "reason": "Can xu ly gap theo V2.5.",
+                "expected_assignment_version": 0,
+            },
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["assigned_to"]["username"], "handler")
+        self.assertEqual(body["assigned_department"], "To xu ly nhanh")
+        self.assertEqual(body["priority"], ReportPriority.URGENT.value)
+        self.assertEqual(body["assignment_version"], 1)
+        self.assertEqual(len(body["assignment_history"]), 1)
+        self.assertEqual(body["assignment_history"][0]["changed_by"]["username"], "receiver")
+        self.assertEqual(body["assignment_history"][0]["new_assigned_to"]["username"], "handler")
+        self.assertEqual(body["assignment_history"][0]["reason"], "Can xu ly gap theo V2.5.")
+
+        my_work = self.client.get("/api/admin/reports/my-work", headers=self.auth_headers("handler", "handler-password"))
+        filtered = self.client.get(
+            "/api/admin/reports",
+            params={"assigned_to": handler, "assigned_department": "xu ly", "priority": "URGENT"},
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(my_work.status_code, 200)
+        self.assertIn(report_id, [item["id"] for item in my_work.json()["items"]])
+        self.assertEqual(filtered.status_code, 200)
+        self.assertEqual(filtered.json()["total"], 1)
+        self.assertEqual(filtered.json()["items"][0]["assigned_to"]["username"], "handler")
+        with self.SessionTesting() as db:
+            history = db.query(ReportAssignmentHistory).filter(ReportAssignmentHistory.report_id == report_id).one()
+            self.assertEqual(history.changed_by_user.username, "receiver")
+            self.assertEqual(history.new_assigned_to_user.username, "handler")
+            audit = db.query(AuditLog).filter(AuditLog.action == "REPORT_ASSIGNMENT_CHANGE").one()
+            self.assertEqual(audit.user.username, "receiver")
+
+    def test_assignment_rejects_stale_assignment_version(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        handler = self.user_id("handler")
+
+        first = self.client.post(
+            f"/api/admin/reports/{report_id}/assignment",
+            json={
+                "assigned_to": handler,
+                "assigned_department": "To xu ly nhanh",
+                "priority": "HIGH",
+                "reason": "Phan cong lan dau.",
+                "expected_assignment_version": 0,
+            },
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+        stale = self.client.post(
+            f"/api/admin/reports/{report_id}/assignment",
+            json={
+                "assigned_to": handler,
+                "assigned_department": "To khac",
+                "priority": "URGENT",
+                "reason": "Du lieu cu khong duoc ghi de.",
+                "expected_assignment_version": 0,
+            },
+            headers=self.auth_headers("admin", "admin-password"),
+        )
+        current = self.client.get(
+            f"/api/admin/reports/{report_id}",
+            headers=self.auth_headers("admin", "admin-password"),
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["assignment_version"], 1)
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(current.status_code, 200)
+        self.assertEqual(current.json()["assigned_department"], "To xu ly nhanh")
+        self.assertEqual(current.json()["priority"], ReportPriority.HIGH.value)
+        self.assertEqual(current.json()["assignment_version"], 1)
+        self.assertEqual(len(current.json()["assignment_history"]), 1)
+
+    def test_processing_image_upload_rejects_initial_type(self):
+        report_id = self.report_id("YT360-AAAAAA")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/attachments",
+            data={"attachment_type": "INITIAL"},
+            files=[("images", ("fake-initial.png", PNG_BYTES, "image/png"))],
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+
+        self.assertEqual(response.status_code, 422)
+
+    def test_processing_image_upload_rejects_empty_file_list(self):
+        report_id = self.report_id("YT360-AAAAAA")
+
+        response = self.client.post(
+            f"/api/admin/reports/{report_id}/attachments",
+            data={"attachment_type": "AFTER"},
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+
+        self.assertIn(response.status_code, {400, 422})
+
+    def test_admin_only_report_technical_metadata_endpoint(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        with self.SessionTesting() as db:
+            report = db.get(Report, report_id)
+            report.reporter_ip_hash = "ip-hash"
+            report.reporter_user_agent_hash = "ua-hash"
+            report.request_fingerprint_hash = "fingerprint-hash"
+            report.client_submitted_at = datetime(2026, 10, 7, 9, 30, 0)
+            report.technical_metadata = json.dumps(
+                {
+                    "client_ip_source": "direct",
+                    "client_ip": "192.0.2.1",
+                    "user_agent": "Admin visible UA",
+                    "observed_source_port": 45678,
+                    "source_port_note": "Transport metadata only; not a device or person identifier.",
+                }
+            )
+            db.commit()
+
+        admin_response = self.client.get(
+            f"/api/admin/reports/{report_id}/technical",
+            headers=self.auth_headers(),
+        )
+        receiver_response = self.client.get(
+            f"/api/admin/reports/{report_id}/technical",
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+        no_auth_response = self.client.get(f"/api/admin/reports/{report_id}/technical")
+
+        self.assertEqual(admin_response.status_code, 200)
+        body = admin_response.json()
+        self.assertEqual(body["tracking_code"], "YT360-AAAAAA")
+        self.assertEqual(body["reporter_ip_hash"], "ip-hash")
+        self.assertEqual(body["reporter_user_agent_hash"], "ua-hash")
+        self.assertEqual(body["request_fingerprint_hash"], "fingerprint-hash")
+        self.assertEqual(body["technical_metadata"]["client_ip"], "192.0.2.1")
+        self.assertEqual(body["technical_metadata"]["user_agent"], "Admin visible UA")
+        self.assertEqual(body["technical_metadata"]["observed_source_port"], 45678)
+        self.assertEqual(receiver_response.status_code, 403)
+        self.assertEqual(no_auth_response.status_code, 401)
+
+    def test_admin_can_block_and_unblock_report_source(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        with self.SessionTesting() as db:
+            report = db.get(Report, report_id)
+            report.reporter_ip_hash = "ip-hash-for-block"
+            report.request_fingerprint_hash = "fingerprint-hash-for-block"
+            db.commit()
+
+        headers = self.auth_headers()
+        block_response = self.client.post(
+            f"/api/admin/reports/{report_id}/source-blocks",
+            json={"source_type": "FINGERPRINT", "reason": "Repeated abuse"},
+            headers=headers,
+        )
+        receiver_response = self.client.post(
+            f"/api/admin/reports/{report_id}/source-blocks",
+            json={"source_type": "FINGERPRINT"},
+            headers=self.auth_headers("receiver", "receiver-password"),
+        )
+
+        self.assertEqual(block_response.status_code, 201)
+        body = block_response.json()
+        self.assertEqual(body["source_type"], "FINGERPRINT")
+        self.assertEqual(body["source_hash"], "fingerprint-hash-for-block")
+        self.assertTrue(body["is_active"])
+        self.assertEqual(receiver_response.status_code, 403)
+
+        technical_response = self.client.get(f"/api/admin/reports/{report_id}/technical", headers=headers)
+        self.assertEqual(technical_response.status_code, 200)
+        self.assertEqual(len(technical_response.json()["active_source_blocks"]), 1)
+
+        unblock_response = self.client.post(f"/api/admin/source-blocks/{body['id']}/unblock", headers=headers)
+        self.assertEqual(unblock_response.status_code, 200)
+        self.assertFalse(unblock_response.json()["is_active"])
+        with self.SessionTesting() as db:
+            source_block = db.get(ReportSourceBlock, body["id"])
+            self.assertFalse(source_block.is_active)
+            self.assertIsNotNone(source_block.lifted_at)
 
     def test_valid_receive_transition_updates_report_history_and_audit_log(self):
         report_id = self.report_id("YT360-AAAAAA")
@@ -1069,6 +1676,16 @@ class AuthApiTests(unittest.TestCase):
             report.created_at = datetime(2026, 9, 30, 16, 59, 59)
             report.updated_at = datetime(2026, 9, 30, 16, 59, 59)
             report.internal_note = "SECRET INTERNAL NOTE MUST NOT EXPORT"
+            report.reporter_ip_hash = "IP HASH MUST NOT EXPORT"
+            report.reporter_user_agent_hash = "UA HASH MUST NOT EXPORT"
+            report.request_fingerprint_hash = "FINGERPRINT MUST NOT EXPORT"
+            report.technical_metadata = json.dumps(
+                {
+                    "client_ip": "203.0.113.77",
+                    "observed_source_port": 54321,
+                    "user_agent": "SECRET USER AGENT MUST NOT EXPORT",
+                }
+            )
             category.name = "@TEST Category"
             area.name = "-TEST Area"
             db.commit()
@@ -1105,6 +1722,12 @@ class AuthApiTests(unittest.TestCase):
         self.assertNotIn("token", sheet_xml.lower())
         self.assertNotIn("audit", sheet_xml.lower())
         self.assertNotIn("SECRET INTERNAL NOTE", sheet_xml)
+        self.assertNotIn("IP HASH MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("UA HASH MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("FINGERPRINT MUST NOT EXPORT", sheet_xml)
+        self.assertNotIn("203.0.113.77", sheet_xml)
+        self.assertNotIn("54321", sheet_xml)
+        self.assertNotIn("SECRET USER AGENT", sheet_xml)
         self.assertNotIn("<f>", sheet_xml)
         self.assertIn('t="inlineStr"', sheet_xml)
 
@@ -1250,6 +1873,30 @@ class AuthApiTests(unittest.TestCase):
         )
 
         self.assertEqual(response.status_code, 404)
+
+    def test_attachment_endpoint_serves_database_fallback_when_file_is_missing(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        with self.SessionTesting() as db:
+            attachment = Attachment(
+                report_id=report_id,
+                stored_filename="missing-but-backed-up.png",
+                original_filename="backup.png",
+                mime_type="image/png",
+                file_size=len(PNG_BYTES),
+                file_data=PNG_BYTES,
+            )
+            db.add(attachment)
+            db.commit()
+            attachment_id = attachment.id
+
+        response = self.client.get(
+            f"/api/admin/reports/{report_id}/attachments/{attachment_id}",
+            headers=self.auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "image/png")
+        self.assertEqual(response.content, PNG_BYTES)
 
     def test_admin_role_can_access_admin_endpoint(self):
         response = self.client.get("/api/admin/system", headers=self.auth_headers("admin", "admin-password"))

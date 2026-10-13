@@ -46,6 +46,7 @@ from app.schemas.admin import (
     AdminCategoryIn,
     AdminCategoryOut,
     AdminDashboardOut,
+    AdminDeadlineStatusOut,
     AdminDepartmentIn,
     AdminDepartmentOut,
     AdminMetricOut,
@@ -74,6 +75,8 @@ from app.schemas.admin import (
 router = APIRouter(prefix="/admin", tags=["admin"])
 ADMIN_ROLES = {"ADMIN", "RECEIVER", "HANDLER"}
 VIETNAM_TZ = timezone(timedelta(hours=7))
+DEADLINE_SOON_WINDOW = timedelta(hours=24)
+DEADLINE_COMPLETED_STATUSES = {ReportStatus.RESOLVED, ReportStatus.OUT_OF_SCOPE}
 
 
 @router.get("/dashboard", response_model=AdminDashboardOut)
@@ -96,6 +99,7 @@ def admin_dashboard(
         )
         or 0
     )
+    deadline_counts = count_deadline_statuses(db, datetime.now(timezone.utc))
 
     return AdminDashboardOut(
         message="Bạn đã đăng nhập hệ thống quản trị Yên Trường 360.",
@@ -105,11 +109,23 @@ def admin_dashboard(
             AdminMetricOut(key="coordinating", label="ĐANG PHỐI HỢP", value=coordinating_reports),
             AdminMetricOut(key="resolved", label="ĐÃ XỬ LÝ", value=resolved_reports),
             AdminMetricOut(key="total", label="TỔNG PHẢN ÁNH", value=total_reports),
+            AdminMetricOut(key="deadline_due_soon", label="Sáº®P Äáº¾N Háº N", value=deadline_counts["DUE_SOON"]),
+            AdminMetricOut(key="deadline_overdue", label="QUÃ Háº N", value=deadline_counts["OVERDUE"]),
+            AdminMetricOut(key="deadline_total", label="CO HAN XU LY", value=deadline_counts["TOTAL_WITH_DEADLINE"]),
+            AdminMetricOut(key="deadline_completed_on_time", label="HOAN THANH DUNG HAN", value=deadline_counts["COMPLETED_ON_TIME"]),
+            AdminMetricOut(key="deadline_completed_late", label="HOAN THANH SAU HAN", value=deadline_counts["COMPLETED_LATE"]),
         ],
         work=AdminWorkSummaryOut(
             new_reports=new_reports,
             coordinating_reports=coordinating_reports,
             needs_update=needs_update,
+            deadline_total=deadline_counts["TOTAL_WITH_DEADLINE"],
+            deadline_on_track=deadline_counts["ON_TRACK"],
+            deadline_due_soon=deadline_counts["DUE_SOON"],
+            deadline_overdue=deadline_counts["OVERDUE"],
+            deadline_completed=deadline_counts["COMPLETED"],
+            deadline_completed_on_time=deadline_counts["COMPLETED_ON_TIME"],
+            deadline_completed_late=deadline_counts["COMPLETED_LATE"],
         ),
     )
 
@@ -252,6 +268,10 @@ def list_reports(
     tracking_code: str | None = Query(default=None, max_length=40),
     status: ReportStatus | None = None,
     priority: ReportPriority | None = None,
+    deadline_status: str | None = Query(
+        default=None,
+        pattern="^(ON_TRACK|DUE_SOON|OVERDUE|COMPLETED|COMPLETED_ON_TIME|COMPLETED_LATE|NO_DEADLINE)$",
+    ),
     assigned_to: int | None = Query(default=None, ge=1),
     assigned_department: str | None = Query(default=None, max_length=160),
     category_id: int | None = Query(default=None, ge=1),
@@ -260,7 +280,7 @@ def list_reports(
     to_date: date | None = None,
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
-    sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at|tracking_code|status|priority|assigned_at)$"),
+    sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at|tracking_code|status|priority|assigned_at|deadline_at)$"),
     sort_order: str = Query(default="desc", pattern="^(asc|desc)$"),
 ) -> AdminReportListOut:
     _ = user
@@ -268,6 +288,7 @@ def list_reports(
         tracking_code=tracking_code,
         status=status,
         priority=priority,
+        deadline_status=deadline_status,
         assigned_to=assigned_to,
         assigned_department=assigned_department,
         category_id=category_id,
@@ -285,7 +306,12 @@ def list_reports(
     order_by = sort_column.asc() if sort_order == "asc" else sort_column.desc()
     statement = (
         select(Report)
-        .options(joinedload(Report.category), joinedload(Report.area), joinedload(Report.assigned_to_user))
+        .options(
+            joinedload(Report.category),
+            joinedload(Report.area),
+            joinedload(Report.assigned_to_user),
+            selectinload(Report.status_history),
+        )
         .order_by(order_by, Report.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
@@ -305,17 +331,26 @@ def list_my_work(
     db: Session = Depends(get_db),
     status: ReportStatus | None = None,
     priority: ReportPriority | None = None,
+    deadline_status: str | None = Query(
+        default=None,
+        pattern="^(ON_TRACK|DUE_SOON|OVERDUE|COMPLETED|COMPLETED_ON_TIME|COMPLETED_LATE|NO_DEADLINE)$",
+    ),
     page: int = Query(default=1, ge=1),
     page_size: int = Query(default=10, ge=1, le=100),
 ) -> AdminReportListOut:
-    filters = build_report_filters(status=status, priority=priority, assigned_to=user.id)
+    filters = build_report_filters(status=status, priority=priority, deadline_status=deadline_status, assigned_to=user.id)
 
     total = db.scalar(select(func.count()).select_from(Report).where(*filters)) or 0
     statement = (
         select(Report)
-        .options(joinedload(Report.category), joinedload(Report.area), joinedload(Report.assigned_to_user))
+        .options(
+            joinedload(Report.category),
+            joinedload(Report.area),
+            joinedload(Report.assigned_to_user),
+            selectinload(Report.status_history),
+        )
         .where(*filters)
-        .order_by(Report.priority.desc(), Report.updated_at.desc(), Report.id.desc())
+        .order_by(Report.deadline_at.is_(None), Report.deadline_at.asc(), Report.priority.desc(), Report.updated_at.desc(), Report.id.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
@@ -362,6 +397,7 @@ def assign_report(
     old_department = report.assigned_department
     old_priority = report.priority
     old_deadline_at = report.deadline_at
+    new_deadline_at = deadline_input_to_utc_naive(payload.deadline_at)
     reason = require_assignment_reason(payload.reason)
 
     new_assigned_to = new_assigned_to_user.id if new_assigned_to_user else None
@@ -377,7 +413,7 @@ def assign_report(
             assigned_to=new_assigned_to,
             assigned_department=new_department,
             priority=payload.priority,
-            deadline_at=payload.deadline_at,
+            deadline_at=new_deadline_at,
             assigned_at=new_assigned_at,
             assignment_version=new_assignment_version,
         )
@@ -397,7 +433,7 @@ def assign_report(
             old_priority=old_priority,
             new_priority=payload.priority,
             old_deadline_at=old_deadline_at,
-            new_deadline_at=payload.deadline_at,
+            new_deadline_at=new_deadline_at,
             reason=reason,
             changed_by=user.id,
         )
@@ -418,6 +454,8 @@ def assign_report(
                     "old_priority": old_priority.value if hasattr(old_priority, "value") else str(old_priority),
                     "new_priority": payload.priority.value,
                     "assignment_version": new_assignment_version,
+                    "old_deadline_at": old_deadline_at.isoformat() if old_deadline_at else None,
+                    "new_deadline_at": new_deadline_at.isoformat() if new_deadline_at else None,
                     "has_reason": True,
                 },
                 ensure_ascii=False,
@@ -1149,6 +1187,200 @@ def _count_status(db: Session, status: ReportStatus) -> int:
     return db.scalar(select(func.count()).select_from(Report).where(Report.status == status)) or 0
 
 
+def completed_at_scalar_subquery():
+    return (
+        select(func.min(StatusHistory.created_at))
+        .where(
+            StatusHistory.report_id == Report.id,
+            StatusHistory.new_status.in_(DEADLINE_COMPLETED_STATUSES),
+        )
+        .correlate(Report)
+        .scalar_subquery()
+    )
+
+
+def count_deadline_statuses(db: Session, now: datetime) -> dict[str, int]:
+    now_utc = as_utc(now)
+    now_naive = now_utc.replace(tzinfo=None)
+    soon_naive = (now_utc + DEADLINE_SOON_WINDOW).replace(tzinfo=None)
+    active_filter = Report.status.not_in(DEADLINE_COMPLETED_STATUSES)
+    completed_at = completed_at_scalar_subquery()
+    return {
+        "TOTAL_WITH_DEADLINE": db.scalar(
+            select(func.count()).select_from(Report).where(Report.deadline_at.is_not(None))
+        )
+        or 0,
+        "ON_TRACK": db.scalar(
+            select(func.count())
+            .select_from(Report)
+            .where(active_filter, Report.deadline_at.is_not(None), Report.deadline_at > soon_naive)
+        )
+        or 0,
+        "DUE_SOON": db.scalar(
+            select(func.count())
+            .select_from(Report)
+            .where(
+                active_filter,
+                Report.deadline_at.is_not(None),
+                Report.deadline_at >= now_naive,
+                Report.deadline_at <= soon_naive,
+            )
+        )
+        or 0,
+        "OVERDUE": db.scalar(
+            select(func.count())
+            .select_from(Report)
+            .where(active_filter, Report.deadline_at.is_not(None), Report.deadline_at < now_naive)
+        )
+        or 0,
+        "COMPLETED": db.scalar(
+            select(func.count()).select_from(Report).where(Report.status.in_(DEADLINE_COMPLETED_STATUSES))
+        )
+        or 0,
+        "COMPLETED_ON_TIME": db.scalar(
+            select(func.count())
+            .select_from(Report)
+            .where(
+                Report.status.in_(DEADLINE_COMPLETED_STATUSES),
+                Report.deadline_at.is_not(None),
+                completed_at.is_not(None),
+                completed_at <= Report.deadline_at,
+            )
+        )
+        or 0,
+        "COMPLETED_LATE": db.scalar(
+            select(func.count())
+            .select_from(Report)
+            .where(
+                Report.status.in_(DEADLINE_COMPLETED_STATUSES),
+                Report.deadline_at.is_not(None),
+                completed_at.is_not(None),
+                completed_at > Report.deadline_at,
+            )
+        )
+        or 0,
+    }
+
+
+def deadline_status_filters(code: str, now: datetime) -> list:
+    normalized = code.strip().upper()
+    now_utc = as_utc(now)
+    now_naive = now_utc.replace(tzinfo=None)
+    soon_naive = (now_utc + DEADLINE_SOON_WINDOW).replace(tzinfo=None)
+    active_filter = Report.status.not_in(DEADLINE_COMPLETED_STATUSES)
+    completed_at = completed_at_scalar_subquery()
+    if normalized == "COMPLETED":
+        return [Report.status.in_(DEADLINE_COMPLETED_STATUSES)]
+    if normalized == "COMPLETED_ON_TIME":
+        return [
+            Report.status.in_(DEADLINE_COMPLETED_STATUSES),
+            Report.deadline_at.is_not(None),
+            completed_at.is_not(None),
+            completed_at <= Report.deadline_at,
+        ]
+    if normalized == "COMPLETED_LATE":
+        return [
+            Report.status.in_(DEADLINE_COMPLETED_STATUSES),
+            Report.deadline_at.is_not(None),
+            completed_at.is_not(None),
+            completed_at > Report.deadline_at,
+        ]
+    if normalized == "OVERDUE":
+        return [active_filter, Report.deadline_at.is_not(None), Report.deadline_at < now_naive]
+    if normalized == "DUE_SOON":
+        return [
+            active_filter,
+            Report.deadline_at.is_not(None),
+            Report.deadline_at >= now_naive,
+            Report.deadline_at <= soon_naive,
+        ]
+    if normalized == "ON_TRACK":
+        return [active_filter, Report.deadline_at.is_not(None), Report.deadline_at > soon_naive]
+    if normalized == "NO_DEADLINE":
+        return [active_filter, Report.deadline_at.is_(None)]
+    raise HTTPException(status_code=422, detail="Trang thai han xu ly khong hop le.")
+
+
+def as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def deadline_input_to_utc_naive(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=VIETNAM_TZ).astimezone(timezone.utc).replace(tzinfo=None)
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def report_completed_at(report: Report) -> datetime | None:
+    completed_changes = [
+        item.created_at
+        for item in (report.status_history or [])
+        if item.new_status in DEADLINE_COMPLETED_STATUSES
+    ]
+    if not completed_changes:
+        return None
+    return min(completed_changes)
+
+
+def deadline_status_out(report: Report, now: datetime | None = None) -> AdminDeadlineStatusOut:
+    if report.status in DEADLINE_COMPLETED_STATUSES:
+        completed_at = report_completed_at(report)
+        if report.deadline_at is None or completed_at is None:
+            return AdminDeadlineStatusOut(
+                code="COMPLETED",
+                label="Hoan thanh",
+                is_alert=False,
+                completed_at=completed_at,
+            )
+        deadline_utc = as_utc(report.deadline_at)
+        completed_utc = as_utc(completed_at)
+        if completed_utc <= deadline_utc:
+            return AdminDeadlineStatusOut(
+                code="COMPLETED_ON_TIME",
+                label="Hoan thanh dung han",
+                is_alert=False,
+                remaining_seconds=0,
+                completed_at=completed_at,
+            )
+        return AdminDeadlineStatusOut(
+            code="COMPLETED_LATE",
+            label="Hoan thanh sau han",
+            is_alert=False,
+            remaining_seconds=0,
+            completed_at=completed_at,
+        )
+    if report.deadline_at is None:
+        return AdminDeadlineStatusOut(code="NO_DEADLINE", label="Chua co han", is_alert=False)
+
+    now_utc = as_utc(now or datetime.now(timezone.utc))
+    deadline_utc = as_utc(report.deadline_at)
+    remaining_seconds = int((deadline_utc - now_utc).total_seconds())
+    if now_utc > deadline_utc:
+        return AdminDeadlineStatusOut(
+            code="OVERDUE",
+            label="Qua han",
+            is_alert=True,
+            remaining_seconds=remaining_seconds,
+        )
+    if deadline_utc <= now_utc + DEADLINE_SOON_WINDOW:
+        return AdminDeadlineStatusOut(
+            code="DUE_SOON",
+            label="Sap den han",
+            is_alert=True,
+            remaining_seconds=remaining_seconds,
+        )
+    return AdminDeadlineStatusOut(
+        code="ON_TRACK",
+        label="Con han",
+        is_alert=False,
+        remaining_seconds=remaining_seconds,
+    )
+
+
 def normalized_public_site_url() -> str:
     target_url = settings.public_site_url.strip().rstrip("/")
     if not target_url:
@@ -1169,6 +1401,7 @@ def build_report_filters(
     tracking_code: str | None = None,
     status: ReportStatus | None = None,
     priority: ReportPriority | None = None,
+    deadline_status: str | None = None,
     assigned_to: int | None = None,
     assigned_department: str | None = None,
     category_id: int | None = None,
@@ -1183,6 +1416,8 @@ def build_report_filters(
         filters.append(Report.status == status)
     if priority:
         filters.append(Report.priority == priority)
+    if deadline_status:
+        filters.extend(deadline_status_filters(deadline_status, datetime.now(timezone.utc)))
     if assigned_to:
         filters.append(Report.assigned_to == assigned_to)
     if assigned_department:
@@ -1458,6 +1693,8 @@ def admin_report_list_item_out(report: Report) -> AdminReportListItemOut:
         assigned_department=report.assigned_department,
         assignment_version=report.assignment_version,
         assigned_at=report.assigned_at,
+        deadline_at=report.deadline_at,
+        deadline_status=deadline_status_out(report),
     )
 
 
@@ -1882,6 +2119,7 @@ def report_detail_out(report: Report) -> AdminReportDetailOut:
         assignment_version=report.assignment_version,
         assigned_at=report.assigned_at,
         deadline_at=report.deadline_at,
+        deadline_status=deadline_status_out(report),
         public_response=report.public_response,
         internal_note=report.internal_note,
         attachments=[

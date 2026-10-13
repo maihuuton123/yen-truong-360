@@ -17,6 +17,21 @@ class AdminWorkSummaryOut(BaseModel):
     new_reports: int
     coordinating_reports: int
     needs_update: int
+    deadline_total: int = 0
+    deadline_on_track: int = 0
+    deadline_due_soon: int = 0
+    deadline_overdue: int = 0
+    deadline_completed: int = 0
+    deadline_completed_on_time: int = 0
+    deadline_completed_late: int = 0
+
+
+class AdminDeadlineStatusOut(BaseModel):
+    code: str
+    label: str
+    is_alert: bool = False
+    remaining_seconds: int | None = None
+    completed_at: datetime | None = None
 
 
 class AdminDashboardOut(BaseModel):
@@ -85,6 +100,8 @@ class AdminReportListItemOut(BaseModel):
     assigned_department: str | None = None
     assignment_version: int = 0
     assigned_at: datetime | None = None
+    deadline_at: datetime | None = None
+    deadline_status: AdminDeadlineStatusOut
 
 
 class AdminReportListOut(BaseModel):
@@ -157,6 +174,7 @@ class AdminReportDetailOut(BaseModel):
     assignment_version: int = 0
     assigned_at: datetime | None = None
     deadline_at: datetime | None = None
+    deadline_status: AdminDeadlineStatusOut
     public_response: str | None
     internal_note: str | None
     attachments: list[AdminAttachmentOut]

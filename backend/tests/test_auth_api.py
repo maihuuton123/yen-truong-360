@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -19,6 +20,8 @@ from app.db.base import Base
 from app.db.dependencies import get_db
 from app.main import create_app
 from app.models import (
+    AdditionalInfoRequest,
+    AdditionalInfoRequestStatus,
     Area,
     Attachment,
     AuditLog,
@@ -27,6 +30,7 @@ from app.models import (
     DuplicateLinkStatus,
     Report,
     ReportAssignmentHistory,
+    ReportInternalNote,
     ReportPriority,
     ReportDuplicateLink,
     ReportSourceBlock,
@@ -59,6 +63,7 @@ class AuthApiTests(unittest.TestCase):
 
         app = create_app()
         app.dependency_overrides[get_db] = self.override_get_db
+        self.app = app
         self.client = TestClient(app)
 
     def tearDown(self):
@@ -1282,6 +1287,148 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(current.json()["priority"], ReportPriority.HIGH.value)
         self.assertEqual(current.json()["assignment_version"], 1)
         self.assertEqual(len(current.json()["assignment_history"]), 1)
+
+    def test_v27_internal_notes_secure_additional_info_and_audit(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        admin_headers = self.auth_headers("admin", "admin-password")
+
+        note_response = self.client.post(
+            f"/api/admin/reports/{report_id}/internal-notes",
+            json={"note": "SECRET V27 INTERNAL NOTE"},
+            headers=admin_headers,
+        )
+        request_response = self.client.post(
+            f"/api/admin/reports/{report_id}/additional-info-requests",
+            json={
+                "public_message": "Vui long bo sung mo ta hien truong.",
+                "internal_note": "SECRET REQUEST INTERNAL NOTE",
+            },
+            headers=admin_headers,
+        )
+
+        self.assertEqual(note_response.status_code, 201)
+        self.assertEqual(note_response.json()["internal_notes"][0]["note"], "SECRET V27 INTERNAL NOTE")
+        self.assertEqual(request_response.status_code, 201)
+        request_body = request_response.json()
+        self.assertTrue(request_body["submission_token"])
+        self.assertIn("/bo-sung?token=", request_body["submission_url"])
+
+        expiring_response = self.client.post(
+            f"/api/admin/reports/{report_id}/additional-info-requests",
+            json={"public_message": "Yeu cau se het han trong test."},
+            headers=admin_headers,
+        )
+        self.assertEqual(expiring_response.status_code, 201)
+        with self.SessionTesting() as db:
+            expiring_item = db.query(AdditionalInfoRequest).filter(
+                AdditionalInfoRequest.id == expiring_response.json()["id"]
+            ).one()
+            expiring_item.response_token_expires_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=1)
+            db.commit()
+        expired_token = self.client.post(
+            f"/api/public/additional-info/{expiring_response.json()['submission_token']}",
+            json={"response_text": "Expired token must fail."},
+        )
+
+        wrong_token = self.client.post(
+            "/api/public/additional-info/not-a-valid-secret-token-value-123456789",
+            json={"response_text": "Attempt with wrong token."},
+        )
+        valid_token = self.client.post(
+            f"/api/public/additional-info/{request_body['submission_token']}",
+            json={"response_text": "Thong tin bo sung tu nguoi dan."},
+        )
+        replay = self.client.post(
+            f"/api/public/additional-info/{request_body['submission_token']}",
+            json={"response_text": "Replay must fail."},
+        )
+        public_lookup = self.client.get("/api/public/reports/YT360-AAAAAA")
+
+        self.assertEqual(wrong_token.status_code, 404)
+        self.assertEqual(expired_token.status_code, 410)
+        self.assertEqual(valid_token.status_code, 200)
+        self.assertIn(replay.status_code, {404, 409})
+        self.assertEqual(public_lookup.status_code, 200)
+        public_text = public_lookup.text.lower()
+        self.assertNotIn("secret v27 internal note", public_text)
+        self.assertNotIn("secret request internal note", public_text)
+        self.assertNotIn("submission_token", public_text)
+        self.assertNotIn("response_text", public_text)
+        self.assertEqual(public_lookup.json()["additional_info_requests"][0]["status"], "RESPONDED")
+
+        detail = self.client.get(f"/api/admin/reports/{report_id}", headers=admin_headers)
+        self.assertEqual(detail.status_code, 200)
+        self.assertTrue(any(item["event_type"] == "INTERNAL_NOTE" for item in detail.json()["timeline"]))
+        self.assertTrue(any(item["event_type"] == "PUBLIC_RESPONSE" for item in detail.json()["timeline"]))
+        with self.SessionTesting() as db:
+            request_item = db.query(AdditionalInfoRequest).filter(
+                AdditionalInfoRequest.id == request_body["id"]
+            ).one()
+            self.assertEqual(request_item.status, AdditionalInfoRequestStatus.RESPONDED)
+            self.assertIsNone(request_item.response_token_hash)
+            self.assertEqual(request_item.response_text, "Thong tin bo sung tu nguoi dan.")
+            self.assertEqual(db.query(ReportInternalNote).filter(ReportInternalNote.report_id == report_id).count(), 1)
+            actions = {item.action for item in db.query(AuditLog).all()}
+            self.assertIn("REPORT_INTERNAL_NOTE_ADD", actions)
+            self.assertIn("REPORT_ADDITIONAL_INFO_REQUEST", actions)
+            self.assertIn("PUBLIC_ADDITIONAL_INFO_RESPONSE", actions)
+
+    def test_v27_out_of_scope_requires_public_reason_and_keeps_report(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        headers = self.auth_headers("receiver", "receiver-password")
+
+        missing_reason = self.client.post(
+            f"/api/admin/reports/{report_id}/out-of-scope",
+            json={"internal_note": "No public reason."},
+            headers=headers,
+        )
+        valid = self.client.post(
+            f"/api/admin/reports/{report_id}/out-of-scope",
+            json={"public_note": "Khong thuoc tham quyen. Vui long lien he don vi chuyen mon."},
+            headers=headers,
+        )
+
+        self.assertEqual(missing_reason.status_code, 422)
+        self.assertEqual(valid.status_code, 200)
+        self.assertEqual(valid.json()["status"], "OUT_OF_SCOPE")
+        with self.SessionTesting() as db:
+            self.assertIsNotNone(db.get(Report, report_id))
+
+    def test_v27_additional_info_token_accepts_only_one_concurrent_response(self):
+        report_id = self.report_id("YT360-AAAAAA")
+        created = self.client.post(
+            f"/api/admin/reports/{report_id}/additional-info-requests",
+            json={"public_message": "Vui long bo sung thong tin dong thoi."},
+            headers=self.auth_headers("admin", "admin-password"),
+        )
+        self.assertEqual(created.status_code, 201)
+        token = created.json()["submission_token"]
+
+        def submit(value: str):
+            with TestClient(self.app) as client:
+                return client.post(
+                    f"/api/public/additional-info/{token}",
+                    json={"response_text": value},
+                )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(submit, ["Phan hoi A", "Phan hoi B"]))
+
+        status_codes = [response.status_code for response in responses]
+        self.assertEqual(status_codes.count(200), 1)
+        self.assertIn(next(code for code in status_codes if code != 200), {404, 409})
+        with self.SessionTesting() as db:
+            request_item = db.query(AdditionalInfoRequest).filter(
+                AdditionalInfoRequest.id == created.json()["id"]
+            ).one()
+            self.assertIn(request_item.response_text, {"Phan hoi A", "Phan hoi B"})
+            self.assertEqual(request_item.status, AdditionalInfoRequestStatus.RESPONDED)
+            self.assertIsNone(request_item.response_token_hash)
+            audit_count = db.query(AuditLog).filter(
+                AuditLog.action == "PUBLIC_ADDITIONAL_INFO_RESPONSE",
+                AuditLog.entity_id == request_item.id,
+            ).count()
+            self.assertEqual(audit_count, 1)
 
     def test_processing_image_upload_rejects_initial_type(self):
         report_id = self.assign_report_to_user("YT360-AAAAAA")

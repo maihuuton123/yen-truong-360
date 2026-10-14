@@ -179,6 +179,14 @@ class AuthApiTests(unittest.TestCase):
         with self.SessionTesting() as db:
             return db.query(User).filter(User.username == username).one().id
 
+    def assign_report_to_user(self, tracking_code, username="handler"):
+        user_id = self.user_id(username)
+        with self.SessionTesting() as db:
+            report = db.query(Report).filter(Report.tracking_code == tracking_code).one()
+            report.assigned_to = user_id
+            db.commit()
+            return report.id
+
     def test_login_success_returns_token_and_user_without_password_hash(self):
         response = self.login()
 
@@ -1080,6 +1088,33 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(body["duplicate_links"], [])
         self.assertEqual(body["status_history"], [])
 
+    def test_handler_reports_are_limited_to_assigned_reports(self):
+        assigned_report_id = self.assign_report_to_user("YT360-AAAAAA")
+        unassigned_report_id = self.report_id("YT360-BBBBBB")
+
+        list_response = self.client.get(
+            "/api/admin/reports",
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        assigned_detail = self.client.get(
+            f"/api/admin/reports/{assigned_report_id}",
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        forbidden_detail = self.client.get(
+            f"/api/admin/reports/{unassigned_report_id}",
+            headers=self.auth_headers("handler", "handler-password"),
+        )
+        admin_detail = self.client.get(
+            f"/api/admin/reports/{unassigned_report_id}",
+            headers=self.auth_headers("admin", "admin-password"),
+        )
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual([item["id"] for item in list_response.json()["items"]], [assigned_report_id])
+        self.assertEqual(assigned_detail.status_code, 200)
+        self.assertEqual(forbidden_detail.status_code, 403)
+        self.assertEqual(admin_detail.status_code, 200)
+
     def test_admin_can_link_related_reports_without_merging_originals(self):
         report_id = self.report_id("YT360-AAAAAA")
         related_report_id = self.report_id("YT360-BBBBBB")
@@ -1122,7 +1157,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_handler_can_upload_processing_images_but_receiver_cannot(self):
-        report_id = self.report_id("YT360-AAAAAA")
+        report_id = self.assign_report_to_user("YT360-AAAAAA")
 
         response = self.client.post(
             f"/api/admin/reports/{report_id}/attachments",
@@ -1249,7 +1284,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(len(current.json()["assignment_history"]), 1)
 
     def test_processing_image_upload_rejects_initial_type(self):
-        report_id = self.report_id("YT360-AAAAAA")
+        report_id = self.assign_report_to_user("YT360-AAAAAA")
 
         response = self.client.post(
             f"/api/admin/reports/{report_id}/attachments",
@@ -1261,7 +1296,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_processing_image_upload_rejects_empty_file_list(self):
-        report_id = self.report_id("YT360-AAAAAA")
+        report_id = self.assign_report_to_user("YT360-AAAAAA")
 
         response = self.client.post(
             f"/api/admin/reports/{report_id}/attachments",
@@ -1420,7 +1455,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(body["status_history"][0]["public_note"], "Dang phoi hop xu ly.")
 
     def test_resolve_transition_requires_public_result(self):
-        report_id = self.report_id("YT360-BBBBBB")
+        report_id = self.assign_report_to_user("YT360-BBBBBB")
 
         response = self.client.post(
             f"/api/admin/reports/{report_id}/resolve",
@@ -1431,7 +1466,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
 
     def test_handler_can_resolve_coordinating_report_with_public_result(self):
-        report_id = self.report_id("YT360-BBBBBB")
+        report_id = self.assign_report_to_user("YT360-BBBBBB")
 
         response = self.client.post(
             f"/api/admin/reports/{report_id}/resolve",
@@ -1519,7 +1554,7 @@ class AuthApiTests(unittest.TestCase):
         self.assertEqual(wrong_body.status_code, 422)
 
     def test_public_lookup_shows_public_response_and_never_leaks_internal_data(self):
-        report_id = self.report_id("YT360-DDDDDD")
+        report_id = self.assign_report_to_user("YT360-DDDDDD")
         receiver_headers = self.auth_headers("receiver", "receiver-password")
         handler_headers = self.auth_headers("handler", "handler-password")
 
@@ -1563,11 +1598,12 @@ class AuthApiTests(unittest.TestCase):
 
     def test_dashboard_statistics_update_after_status_change(self):
         headers = self.auth_headers("handler", "handler-password")
+        report_id = self.assign_report_to_user("YT360-BBBBBB")
         before = self.client.get("/api/admin/dashboard", headers=self.auth_headers()).json()
         before_cards = {card["key"]: card["value"] for card in before["cards"]}
 
         response = self.client.post(
-            f"/api/admin/reports/{self.report_id('YT360-BBBBBB')}/resolve",
+            f"/api/admin/reports/{report_id}/resolve",
             json={"public_note": "Resolved for dashboard count."},
             headers=headers,
         )

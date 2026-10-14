@@ -1,12 +1,13 @@
 from datetime import datetime, timedelta, timezone
+import hashlib
 from pathlib import Path
 import json
 import re
 import secrets
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse
-from sqlalchemy import select
+from fastapi.responses import FileResponse, Response
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -17,9 +18,12 @@ from app.core.rate_limit import limit_public_lookup_requests
 from app.db.dependencies import get_db
 from app.models import (
     Area,
+    AdditionalInfoRequest,
+    AdditionalInfoRequestStatus,
     Attachment,
     AttachmentType,
     Category,
+    AuditLog,
     DuplicateLinkStatus,
     Report,
     ReportDuplicateLink,
@@ -27,6 +31,9 @@ from app.models import (
 )
 from app.schemas.public import (
     PublicAttachmentOut,
+    PublicAdditionalInfoRequestOut,
+    PublicAdditionalInfoResponseIn,
+    PublicAdditionalInfoResponseOut,
     PublicAreaOut,
     PublicCategoryOut,
     PublicReportCreatedOut,
@@ -147,6 +154,7 @@ async def create_public_report(
                 original_filename=original_filename,
                 mime_type=mime_type,
                 file_size=len(content),
+                file_data=content,
                 attachment_type=AttachmentType.INITIAL,
                 is_public=False,
             )
@@ -199,6 +207,7 @@ def lookup_public_report(
             selectinload(Report.area),
             selectinload(Report.status_history),
             selectinload(Report.attachments),
+            selectinload(Report.additional_info_requests),
         )
         .where(Report.tracking_code == cleaned_tracking_code)
     )
@@ -217,8 +226,83 @@ def lookup_public_report(
         public_status=public_status_out(report.status),
         public_response=report.public_response,
         public_status_history=build_public_status_history(report),
+        additional_info_requests=[
+            PublicAdditionalInfoRequestOut(
+                id=item.id,
+                status=item.status.value if hasattr(item.status, "value") else str(item.status),
+                public_message=item.public_message,
+                due_at=item.due_at,
+                responded_at=item.responded_at,
+                created_at=item.created_at,
+            )
+            for item in sorted(report.additional_info_requests, key=lambda value: (value.created_at, value.id))
+        ],
         public_attachments=public_attachments_out(report),
     )
+
+
+@router.post(
+    "/additional-info/{token}",
+    response_model=PublicAdditionalInfoResponseOut,
+    dependencies=[Depends(limit_public_lookup_requests)],
+)
+def submit_additional_information(
+    token: str,
+    payload: PublicAdditionalInfoResponseIn,
+    db: Session = Depends(get_db),
+) -> PublicAdditionalInfoResponseOut:
+    if len(token) < 32 or len(token) > 128:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Yeu cau bo sung khong hop le.")
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    request_item = db.scalar(
+        select(AdditionalInfoRequest).where(AdditionalInfoRequest.response_token_hash == token_hash)
+    )
+    if request_item is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Yeu cau bo sung khong hop le.")
+    if request_item.status != AdditionalInfoRequestStatus.OPEN or request_item.responded_at is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Yeu cau bo sung da duoc phan hoi hoac da dong.")
+    now = datetime.now(timezone.utc)
+    if request_item.response_token_expires_at is None or as_utc_public(request_item.response_token_expires_at) < now:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="Duong dan bo sung thong tin da het han.")
+    response_text = payload.response_text.strip()
+    if not response_text:
+        raise HTTPException(status_code=422, detail="Noi dung bo sung la bat buoc.")
+
+    consumed = db.execute(
+        update(AdditionalInfoRequest)
+        .where(
+            AdditionalInfoRequest.id == request_item.id,
+            AdditionalInfoRequest.response_token_hash == token_hash,
+            AdditionalInfoRequest.status == AdditionalInfoRequestStatus.OPEN,
+            AdditionalInfoRequest.responded_at.is_(None),
+        )
+        .values(
+            response_text=response_text,
+            responded_at=now,
+            status=AdditionalInfoRequestStatus.RESPONDED,
+            response_token_hash=None,
+        )
+    )
+    if consumed.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Yeu cau bo sung da duoc phan hoi hoac da dong.")
+    db.add(
+        AuditLog(
+            user_id=None,
+            action="PUBLIC_ADDITIONAL_INFO_RESPONSE",
+            entity_type="additional_info_request",
+            entity_id=request_item.id,
+            details=json.dumps({"report_id": request_item.report_id, "response_length": len(response_text)}),
+        )
+    )
+    db.commit()
+    return PublicAdditionalInfoResponseOut(message="Da gui thong tin bo sung.", responded_at=now)
+
+
+def as_utc_public(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 @router.get("/reports/{tracking_code}/attachments/{attachment_id}")
@@ -249,6 +333,8 @@ def get_public_report_attachment(
     if upload_root != path and upload_root not in path.parents:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File anh khong hop le.")
     if not path.is_file():
+        if attachment.file_data:
+            return Response(content=attachment.file_data, media_type=attachment.mime_type)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="File anh khong con ton tai.")
 
     return FileResponse(path, media_type=attachment.mime_type, filename=attachment.original_filename)

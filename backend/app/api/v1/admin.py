@@ -1,6 +1,8 @@
 from datetime import date, datetime, time, timedelta, timezone
+import hashlib
 from io import BytesIO
 import json
+import secrets
 from pathlib import Path
 from urllib.parse import quote
 from xml.sax.saxutils import escape
@@ -23,12 +25,15 @@ from app.models import (
     Area,
     Attachment,
     AttachmentType,
+    AdditionalInfoRequest,
+    AdditionalInfoRequestStatus,
     AuditLog,
     Category,
     Department,
     DuplicateLinkStatus,
     Report,
     ReportAssignmentHistory,
+    ReportInternalNote,
     ReportDuplicateLink,
     ReportPriority,
     ReportSourceBlock,
@@ -39,6 +44,8 @@ from app.models import (
 from app.schemas.admin import (
     AdminAreaIn,
     AdminAreaOut,
+    AdminAdditionalInfoRequestIn,
+    AdminAdditionalInfoRequestOut,
     AdminAssignmentHistoryOut,
     AdminAttachmentOut,
     AdminAuditLogListOut,
@@ -50,6 +57,8 @@ from app.schemas.admin import (
     AdminDepartmentIn,
     AdminDepartmentOut,
     AdminMetricOut,
+    AdminInternalNoteIn,
+    AdminInternalNoteOut,
     AdminQrOut,
     AdminReportAssignmentIn,
     AdminReportDetailOut,
@@ -64,6 +73,7 @@ from app.schemas.admin import (
     AdminStatisticBucketOut,
     AdminStatisticsOut,
     AdminStatusHistoryOut,
+    AdminTimelineItemOut,
     AdminUserCreateIn,
     AdminUserOut,
     AdminUserPasswordIn,
@@ -374,6 +384,81 @@ def get_report_detail(
     report = load_report_or_404(db, report_id)
     ensure_report_visible_to_user(report, user)
     return report_detail_out(report)
+
+
+@router.post("/reports/{report_id}/internal-notes", response_model=AdminReportDetailOut, status_code=status.HTTP_201_CREATED)
+def add_report_internal_note(
+    report_id: int,
+    payload: AdminInternalNoteIn,
+    user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
+    db: Session = Depends(get_db),
+) -> AdminReportDetailOut:
+    report = load_report_or_404(db, report_id)
+    ensure_report_visible_to_user(report, user)
+    note = clean_text(payload.note)
+    if not note:
+        raise HTTPException(status_code=422, detail="Ghi chu noi bo la bat buoc.")
+    db.add(ReportInternalNote(report_id=report.id, author_user_id=user.id, note=note))
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="REPORT_INTERNAL_NOTE_ADD",
+            entity_type="report",
+            entity_id=report.id,
+            details=json.dumps({"tracking_code": report.tracking_code, "note_length": len(note)}),
+        )
+    )
+    db.commit()
+    return report_detail_out(load_report_or_404(db, report.id))
+
+
+@router.post(
+    "/reports/{report_id}/additional-info-requests",
+    response_model=AdminAdditionalInfoRequestOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_additional_info_request(
+    report_id: int,
+    payload: AdminAdditionalInfoRequestIn,
+    user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
+    db: Session = Depends(get_db),
+) -> AdminAdditionalInfoRequestOut:
+    report = load_report_or_404(db, report_id)
+    ensure_report_visible_to_user(report, user)
+    public_message = clean_text(payload.public_message)
+    if not public_message:
+        raise HTTPException(status_code=422, detail="Noi dung yeu cau bo sung la bat buoc.")
+
+    raw_token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    request_item = AdditionalInfoRequest(
+        report_id=report.id,
+        requested_by=user.id,
+        status=AdditionalInfoRequestStatus.OPEN,
+        public_message=public_message,
+        internal_note=clean_text(payload.internal_note),
+        due_at=deadline_input_to_utc_naive(payload.due_at),
+        response_token_hash=token_hash,
+        response_token_expires_at=expires_at.replace(tzinfo=None),
+    )
+    db.add(request_item)
+    db.flush()
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            action="REPORT_ADDITIONAL_INFO_REQUEST",
+            entity_type="additional_info_request",
+            entity_id=request_item.id,
+            details=json.dumps(
+                {"report_id": report.id, "tracking_code": report.tracking_code, "has_internal_note": bool(request_item.internal_note)},
+                ensure_ascii=False,
+            ),
+        )
+    )
+    db.commit()
+    db.refresh(request_item)
+    return additional_info_request_out(request_item, submission_token=raw_token)
 
 
 @router.post("/reports/{report_id}/assignment", response_model=AdminReportDetailOut)
@@ -1123,6 +1208,11 @@ def mark_report_out_of_scope(
     user: User = Depends(require_roles("ADMIN", "RECEIVER")),
     db: Session = Depends(get_db),
 ) -> AdminReportDetailOut:
+    if not clean_text(payload.public_note):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Vui long ghi ro ly do khong thuoc pham vi va huong dan nguoi dan neu co.",
+        )
     return transition_report(
         db=db,
         report_id=report_id,
@@ -1809,6 +1899,8 @@ def load_report_or_404(db: Session, report_id: int) -> Report:
             selectinload(Report.assignment_history).selectinload(ReportAssignmentHistory.old_assigned_to_user),
             selectinload(Report.assignment_history).selectinload(ReportAssignmentHistory.new_assigned_to_user),
             selectinload(Report.assignment_history).selectinload(ReportAssignmentHistory.changed_by_user),
+            selectinload(Report.internal_notes).selectinload(ReportInternalNote.author_user),
+            selectinload(Report.additional_info_requests).selectinload(AdditionalInfoRequest.requested_by_user),
         )
         .where(Report.id == report_id)
     )
@@ -2114,6 +2206,101 @@ def assignment_history_out(item: ReportAssignmentHistory) -> AdminAssignmentHist
     )
 
 
+def internal_note_out(item: ReportInternalNote) -> AdminInternalNoteOut:
+    return AdminInternalNoteOut(
+        id=item.id,
+        note=item.note,
+        author=auth_user_out(item.author_user) if item.author_user else None,
+        created_at=item.created_at,
+    )
+
+
+def additional_info_request_out(
+    item: AdditionalInfoRequest,
+    *,
+    submission_token: str | None = None,
+) -> AdminAdditionalInfoRequestOut:
+    submission_url = None
+    if submission_token:
+        submission_url = f"{normalized_public_site_url()}/bo-sung?token={submission_token}"
+    return AdminAdditionalInfoRequestOut(
+        id=item.id,
+        status=item.status.value if hasattr(item.status, "value") else str(item.status),
+        public_message=item.public_message,
+        internal_note=item.internal_note,
+        response_text=item.response_text,
+        due_at=item.due_at,
+        responded_at=item.responded_at,
+        requested_by=auth_user_out(item.requested_by_user) if item.requested_by_user else None,
+        created_at=item.created_at,
+        submission_token=submission_token,
+        submission_url=submission_url,
+    )
+
+
+def report_timeline_out(report: Report) -> list[AdminTimelineItemOut]:
+    items: list[AdminTimelineItemOut] = []
+    for item in report.status_history:
+        items.append(
+            AdminTimelineItemOut(
+                id=f"status-{item.id}",
+                event_type="STATUS",
+                title=f"Trang thai: {item.new_status.value}",
+                public_text=item.public_note,
+                internal_text=item.internal_note,
+                actor=auth_user_out(item.changed_by_user) if item.changed_by_user else None,
+                created_at=item.created_at,
+            )
+        )
+    for item in report.assignment_history:
+        recipient = item.new_assigned_to_user.full_name if item.new_assigned_to_user else item.new_assigned_department
+        items.append(
+            AdminTimelineItemOut(
+                id=f"assignment-{item.id}",
+                event_type="ASSIGNMENT",
+                title=f"Phan cong: {recipient or 'Chua giao'}",
+                internal_text=item.reason,
+                actor=auth_user_out(item.changed_by_user) if item.changed_by_user else None,
+                created_at=item.created_at,
+            )
+        )
+    for item in report.internal_notes:
+        if not item.is_deleted:
+            items.append(
+                AdminTimelineItemOut(
+                    id=f"internal-note-{item.id}",
+                    event_type="INTERNAL_NOTE",
+                    title="Ghi chu noi bo",
+                    internal_text=item.note,
+                    actor=auth_user_out(item.author_user) if item.author_user else None,
+                    created_at=item.created_at,
+                )
+            )
+    for item in report.additional_info_requests:
+        items.append(
+            AdminTimelineItemOut(
+                id=f"additional-info-{item.id}",
+                event_type="ADDITIONAL_INFO",
+                title=f"Yeu cau bo sung: {item.status.value}",
+                public_text=item.public_message,
+                internal_text=item.internal_note,
+                actor=auth_user_out(item.requested_by_user) if item.requested_by_user else None,
+                created_at=item.created_at,
+            )
+        )
+        if item.responded_at and item.response_text:
+            items.append(
+                AdminTimelineItemOut(
+                    id=f"additional-info-response-{item.id}",
+                    event_type="PUBLIC_RESPONSE",
+                    title="Nguoi dan da bo sung thong tin",
+                    public_text=item.response_text,
+                    created_at=item.responded_at,
+                )
+            )
+    return sorted(items, key=lambda item: item.created_at)
+
+
 def report_detail_out(report: Report) -> AdminReportDetailOut:
     duplicate_links = [
         duplicate_link_out(link, report.id)
@@ -2171,4 +2358,14 @@ def report_detail_out(report: Report) -> AdminReportDetailOut:
             assignment_history_out(item)
             for item in sorted(report.assignment_history, key=lambda item: (item.created_at, item.id))
         ],
+        internal_notes=[
+            internal_note_out(item)
+            for item in sorted(report.internal_notes, key=lambda item: (item.created_at, item.id))
+            if not item.is_deleted
+        ],
+        additional_info_requests=[
+            additional_info_request_out(item)
+            for item in sorted(report.additional_info_requests, key=lambda item: (item.created_at, item.id))
+        ],
+        timeline=report_timeline_out(report),
     )

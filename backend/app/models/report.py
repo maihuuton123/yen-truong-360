@@ -420,6 +420,8 @@ class AdditionalInfoRequest(Base):
     public_message: Mapped[str] = mapped_column(Text, nullable=False)
     internal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    response_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)

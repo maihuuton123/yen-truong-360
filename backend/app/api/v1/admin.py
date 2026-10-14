@@ -283,7 +283,6 @@ def list_reports(
     sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at|tracking_code|status|priority|assigned_at|deadline_at)$"),
     sort_order: str = Query(default="desc", pattern="^(asc|desc)$"),
 ) -> AdminReportListOut:
-    _ = user
     filters = build_report_filters(
         tracking_code=tracking_code,
         status=status,
@@ -296,6 +295,7 @@ def list_reports(
         from_date=from_date,
         to_date=to_date,
     )
+    filters.extend(report_visibility_filters(user))
 
     total_statement = select(func.count()).select_from(Report)
     if filters:
@@ -371,8 +371,9 @@ def get_report_detail(
     user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
     db: Session = Depends(get_db),
 ) -> AdminReportDetailOut:
-    _ = user
-    return report_detail_out(load_report_or_404(db, report_id))
+    report = load_report_or_404(db, report_id)
+    ensure_report_visible_to_user(report, user)
+    return report_detail_out(report)
 
 
 @router.post("/reports/{report_id}/assignment", response_model=AdminReportDetailOut)
@@ -969,7 +970,8 @@ def get_report_attachment(
     user: User = Depends(require_roles("ADMIN", "RECEIVER", "HANDLER")),
     db: Session = Depends(get_db),
 ) -> FileResponse:
-    _ = user
+    report = load_report_or_404(db, report_id)
+    ensure_report_visible_to_user(report, user)
     attachment = db.scalar(
         select(Attachment).where(
             Attachment.id == attachment_id,
@@ -1000,6 +1002,7 @@ async def upload_report_processing_attachments(
     db: Session = Depends(get_db),
 ) -> AdminReportDetailOut:
     report = load_report_or_404(db, report_id)
+    ensure_report_visible_to_user(report, user)
     try:
         parsed_type = AttachmentType(attachment_type)
     except ValueError as exc:
@@ -1814,6 +1817,20 @@ def load_report_or_404(db: Session, report_id: int) -> Report:
     return report
 
 
+def report_visibility_filters(user: User) -> list:
+    if user.role == "HANDLER":
+        return [Report.assigned_to == user.id]
+    return []
+
+
+def ensure_report_visible_to_user(report: Report, user: User) -> None:
+    if user.role == "HANDLER" and report.assigned_to != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Tai khoan can bo chi duoc xem phan anh duoc phan cong cho minh.",
+        )
+
+
 def transition_report(
     *,
     db: Session,
@@ -1826,6 +1843,7 @@ def transition_report(
     update_public_response: bool = False,
 ) -> AdminReportDetailOut:
     report = load_report_or_404(db, report_id)
+    ensure_report_visible_to_user(report, user)
     old_status = report.status
     if old_status not in expected_statuses:
         allowed = ", ".join(sorted(status_value.value for status_value in expected_statuses))

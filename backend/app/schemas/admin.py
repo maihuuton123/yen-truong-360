@@ -159,6 +159,47 @@ class AdminAssignmentHistoryOut(BaseModel):
     created_at: datetime
 
 
+class AdminInternalNoteIn(BaseModel):
+    note: str = Field(min_length=1, max_length=2000)
+
+
+class AdminInternalNoteOut(BaseModel):
+    id: int
+    note: str
+    author: AuthUserOut | None
+    created_at: datetime
+
+
+class AdminAdditionalInfoRequestIn(BaseModel):
+    public_message: str = Field(min_length=1, max_length=2000)
+    internal_note: str | None = Field(default=None, max_length=2000)
+    due_at: datetime | None = None
+
+
+class AdminAdditionalInfoRequestOut(BaseModel):
+    id: int
+    status: str
+    public_message: str
+    internal_note: str | None
+    response_text: str | None
+    due_at: datetime | None
+    responded_at: datetime | None
+    requested_by: AuthUserOut | None
+    created_at: datetime
+    submission_token: str | None = None
+    submission_url: str | None = None
+
+
+class AdminTimelineItemOut(BaseModel):
+    id: str
+    event_type: str
+    title: str
+    public_text: str | None = None
+    internal_text: str | None = None
+    actor: AuthUserOut | None = None
+    created_at: datetime
+
+
 class AdminReportDetailOut(BaseModel):
     id: int
     tracking_code: str
@@ -181,6 +222,9 @@ class AdminReportDetailOut(BaseModel):
     duplicate_links: list[AdminReportDuplicateLinkOut] = Field(default_factory=list)
     status_history: list[AdminStatusHistoryOut]
     assignment_history: list[AdminAssignmentHistoryOut] = Field(default_factory=list)
+    internal_notes: list[AdminInternalNoteOut] = Field(default_factory=list)
+    additional_info_requests: list[AdminAdditionalInfoRequestOut] = Field(default_factory=list)
+    timeline: list[AdminTimelineItemOut] = Field(default_factory=list)
 
 
 class AdminReportTechnicalOut(BaseModel):

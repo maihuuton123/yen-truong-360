@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models import ReportStatus
 
@@ -40,6 +40,24 @@ class PublicReportStatusHistoryOut(BaseModel):
     created_at: datetime
 
 
+class PublicAdditionalInfoRequestOut(BaseModel):
+    id: int
+    status: str
+    public_message: str
+    due_at: datetime | None
+    responded_at: datetime | None
+    created_at: datetime
+
+
+class PublicAdditionalInfoResponseIn(BaseModel):
+    response_text: str = Field(min_length=1, max_length=4000)
+
+
+class PublicAdditionalInfoResponseOut(BaseModel):
+    message: str
+    responded_at: datetime
+
+
 class PublicAttachmentOut(BaseModel):
     id: int
     original_filename: str
@@ -58,4 +76,5 @@ class PublicReportLookupOut(BaseModel):
     public_status: PublicReportStatusOut
     public_response: str | None
     public_status_history: list[PublicReportStatusHistoryOut]
+    additional_info_requests: list[PublicAdditionalInfoRequestOut] = []
     public_attachments: list[PublicAttachmentOut] = []

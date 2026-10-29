@@ -163,6 +163,10 @@ class AdminInternalNoteIn(BaseModel):
     note: str = Field(min_length=1, max_length=2000)
 
 
+class AdminPublicResponseApprovalIn(BaseModel):
+    confirm_sensitive_content: bool = False
+
+
 class AdminInternalNoteOut(BaseModel):
     id: int
     note: str
@@ -217,6 +221,12 @@ class AdminReportDetailOut(BaseModel):
     deadline_at: datetime | None = None
     deadline_status: AdminDeadlineStatusOut
     public_response: str | None
+    pending_public_response: str | None = None
+    pending_public_response_by: int | None = None
+    pending_public_response_at: datetime | None = None
+    public_response_approved_by: int | None = None
+    public_response_approved_at: datetime | None = None
+    pending_public_response_has_sensitive_content: bool = False
     internal_note: str | None
     attachments: list[AdminAttachmentOut]
     duplicate_links: list[AdminReportDuplicateLinkOut] = Field(default_factory=list)

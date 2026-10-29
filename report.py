@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     false,
@@ -133,7 +134,10 @@ class User(Base):
         back_populates="lifted_by_user",
         foreign_keys="ReportSourceBlock.lifted_by",
     )
-    assigned_reports: Mapped[list["Report"]] = relationship(back_populates="assigned_to_user")
+    assigned_reports: Mapped[list["Report"]] = relationship(
+        back_populates="assigned_to_user",
+        foreign_keys="Report.assigned_to",
+    )
     assignment_changes: Mapped[list["ReportAssignmentHistory"]] = relationship(
         back_populates="changed_by_user",
         foreign_keys="ReportAssignmentHistory.changed_by",
@@ -170,6 +174,15 @@ class Area(Base):
     reports: Mapped[list["Report"]] = relationship(back_populates="area")
 
 
+class Department(Base):
+    __tablename__ = "departments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False, unique=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=true(), index=True)
+    display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0", index=True)
+
+
 class Report(Base):
     __tablename__ = "reports"
 
@@ -193,9 +206,16 @@ class Report(Base):
         index=True,
     )
     assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    assigned_department: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    assignment_version: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     assigned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     public_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_public_response: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pending_public_response_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    pending_public_response_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    public_response_approved_by: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    public_response_approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     internal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     location_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
     location_latitude: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -276,6 +296,7 @@ class Attachment(Base):
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(120), nullable=False)
     file_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    file_data: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     attachment_type: Mapped[AttachmentType] = mapped_column(
         attachment_type_enum,
         nullable=False,
@@ -352,6 +373,8 @@ class ReportAssignmentHistory(Base):
     report_id: Mapped[int] = mapped_column(ForeignKey("reports.id", ondelete="CASCADE"), nullable=False, index=True)
     old_assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
     new_assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    old_assigned_department: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    new_assigned_department: Mapped[str | None] = mapped_column(String(160), nullable=True)
     old_priority: Mapped[ReportPriority | None] = mapped_column(priority_enum, nullable=True)
     new_priority: Mapped[ReportPriority | None] = mapped_column(priority_enum, nullable=True)
     old_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -405,6 +428,8 @@ class AdditionalInfoRequest(Base):
     public_message: Mapped[str] = mapped_column(Text, nullable=False)
     internal_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     response_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    response_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    response_token_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
